@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SAM3 RTSP Live Detector</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        body {
+            margin: 0 auto;
+            padding: 1.5rem;
+            max-width: 900px;
+            line-height: 1.4;
+            background: #0d1117;
+            color: #e6edf3;
+        }
+        h1 {
+            margin-top: 0;
+        }
+        form {
+            display: grid;
+            gap: 1rem;
+            padding: 1rem;
+            border: 1px solid #30363d;
+            border-radius: 0.75rem;
+            background: #161b22;
+        }
+        label {
+            font-weight: 600;
+            display: block;
+            margin-bottom: 0.35rem;
+        }
+        input, textarea, select {
+            width: 100%;
+            padding: 0.6rem;
+            border-radius: 0.5rem;
+            border: 1px solid #30363d;
+            background: #0d1117;
+            color: inherit;
+        }
+        textarea {
+            min-height: 6rem;
+        }
+        button {
+            cursor: pointer;
+            padding: 0.7rem 1.2rem;
+            border-radius: 0.6rem;
+            border: none;
+            font-weight: 600;
+        }
+        .btn-row {
+            display: flex;
+            gap: 0.75rem;
+        }
+        .btn-primary {
+            background: #238636;
+            color: white;
+        }
+        .btn-secondary {
+            background: #6e7681;
+            color: white;
+        }
+        .status-box {
+            margin-top: 1rem;
+            padding: 1rem;
+            border-radius: 0.75rem;
+            background: #161b22;
+            border: 1px solid #30363d;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+        }
+        th, td {
+            border: 1px solid #30363d;
+            padding: 0.5rem;
+            text-align: left;
+        }
+        th {
+            background: #1f242d;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.15rem 0.45rem;
+            border-radius: 0.5rem;
+            background: #21262d;
+            font-size: 0.8rem;
+        }
+        .error {
+            color: #ffa7c4;
+        }
+        .hint {
+            font-size: 0.9rem;
+            color: #9da8b7;
+        }
+        .stream-panel {
+            margin-top: 1.5rem;
+        }
+        .stream-wrapper {
+            margin-top: 0.75rem;
+            border: 1px solid #30363d;
+            border-radius: 0.75rem;
+            overflow: hidden;
+            background: #050709;
+        }
+        .stream-wrapper img {
+            width: 100%;
+            display: block;
+            aspect-ratio: 16 / 9;
+            object-fit: contain;
+        }
+    </style>
+</head>
+<body data-max-concepts="{{ max_concepts }}" data-score-threshold="{{ score_threshold }}" data-max-frames="{{ max_frames }}" data-frame-skip="{{ frame_skip }}">
+    <h1>SAM3 RTSP Live Detector</h1>
+    <p>
+        Browsers cannot natively render RTSP video, but this page continuously calls the FastAPI `/detect` endpoint,
+        displays JSON results, and refreshes them on an interval so you can validate detections in near real-time.
+    </p>
+
+    <form id="detect-form">
+        <div>
+            <label for="rtsp-url">RTSP URL</label>
+            <input id="rtsp-url" name="rtsp_url" type="text" placeholder="rtsp://camera-host:8554/live" required />
+        </div>
+        <div>
+            <label for="concepts">Concepts (optional, one per line, max {{ max_concepts }})</label>
+            <textarea id="concepts" name="concepts" placeholder="person
+safety helmet
+fire"></textarea>
+        </div>
+        <div>
+            <label for="max-frames">Frames per request (1-{{ max_frames }})</label>
+            <input id="max-frames" name="max_frames" type="number" min="1" max="{{ max_frames }}" value="{{ max_frames }}" />
+        </div>
+        <div>
+            <label for="frame-skip">Frame skip (defaults to {{ frame_skip }})</label>
+            <input id="frame-skip" name="frame_skip" type="number" min="1" value="{{ frame_skip }}" />
+        </div>
+        <div>
+            <label for="poll-interval">Refresh interval (ms)</label>
+            <input id="poll-interval" name="poll_interval" type="number" min="100" value="3000" />
+        </div>
+        <div class="btn-row">
+            <button type="submit" class="btn-primary">Start live detection</button>
+            <button type="button" id="stop-btn" class="btn-secondary">Stop</button>
+        </div>
+    </form>
+
+    <div class="status-box">
+        <div id="status">Idle</div>
+        <div id="last-run" class="badge">Last run: never</div>
+    </div>
+
+    <section class="stream-panel">
+        <h2>Live stream preview</h2>
+        <p class="hint">The RTSP feed is proxied as MJPEG with detections drawn per frame. Start the detector above to load it.</p>
+        <div class="stream-wrapper">
+            <img id="live-stream" alt="Live detection preview appears here" />
+        </div>
+    </section>
+
+    <section id="results"></section>
+
+    <template id="table-template">
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Frame</th>
+                    <th>Label</th>
+                    <th>Score</th>
+                    <th>BBox (x, y, w, h)</th>
+                    <th>Area(px)</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </template>
+
+    <script>
+        const dataset = document.body.dataset;
+        const config = {
+            maxConcepts: Number(dataset.maxConcepts) || 0,
+            scoreThreshold: Number(dataset.scoreThreshold) || 0.5,
+        };
+        const form = document.getElementById('detect-form');
+        const stopBtn = document.getElementById('stop-btn');
+        const statusEl = document.getElementById('status');
+        const lastRunEl = document.getElementById('last-run');
+        const resultsEl = document.getElementById('results');
+        const tableTpl = document.getElementById('table-template');
+        const streamImg = document.getElementById('live-stream');
+
+        let isRunning = false;
+        let abortController = null;
+
+        form.addEventListener('submit', (event) => {
+            event.preventDefault();
+            if (isRunning) {
+                return;
+            }
+            try {
+                const payload = buildPayload();
+                isRunning = true;
+                statusEl.textContent = 'Running live detection...';
+                startLiveStream(payload);
+                loopDetections(payload);
+            } catch (error) {
+                statusEl.innerHTML = `<span class="error">${error.message}</span>`;
+            }
+        });
+
+        stopBtn.addEventListener('click', () => {
+            if (abortController) {
+                abortController.abort();
+            }
+            isRunning = false;
+            stopLiveStream();
+            statusEl.textContent = 'Stopped';
+        });
+
+        async function loopDetections(payload) {
+            while (isRunning) {
+                try {
+                    abortController = new AbortController();
+                    const response = await fetch('/detect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                        signal: abortController.signal,
+                    });
+                    if (!response.ok) {
+                        throw new Error('Server responded with ' + response.status);
+                    }
+                    const data = await response.json();
+                    renderResults(data);
+                    lastRunEl.textContent = 'Last run: ' + new Date().toLocaleTimeString();
+                    statusEl.textContent = `Frames analyzed: ${data.frames_analyzed}`;
+                } catch (error) {
+                    console.error(error);
+                    statusEl.innerHTML = `<span class="error">${error.message}</span>`;
+                    await delay(2000);
+                }
+
+                if (!isRunning) {
+                    break;
+                }
+
+                const interval = Number(document.getElementById('poll-interval').value) || 3000;
+                await delay(interval);
+            }
+        }
+
+        function buildPayload() {
+            const rtspUrl = document.getElementById('rtsp-url').value.trim();
+            const maxFrames = Number(document.getElementById('max-frames').value) || undefined;
+            const frameSkip = Number(document.getElementById('frame-skip').value) || undefined;
+            const rawConcepts = document.getElementById('concepts').value;
+            const concepts = rawConcepts
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean);
+
+            if (concepts.length > config.maxConcepts) {
+                throw new Error(`Too many concepts supplied (max ${config.maxConcepts}).`);
+            }
+
+            const payload = { rtsp_url: rtspUrl };
+            if (maxFrames) payload.max_frames = maxFrames;
+            if (frameSkip) payload.frame_skip = frameSkip;
+            if (concepts.length > 0) payload.concepts = concepts;
+            return payload;
+        }
+
+        function startLiveStream(payload) {
+            if (!streamImg) {
+                return;
+            }
+            const params = new URLSearchParams();
+            params.set('rtsp_url', payload.rtsp_url);
+            if (payload.frame_skip) {
+                params.set('frame_skip', payload.frame_skip);
+            }
+            if (Array.isArray(payload.concepts)) {
+                payload.concepts.forEach((concept) => params.append('concepts', concept));
+            }
+            streamImg.src = `/live-stream?${params.toString()}`;
+        }
+
+        function stopLiveStream() {
+            if (streamImg) {
+                streamImg.removeAttribute('src');
+            }
+        }
+
+        function renderResults(data) {
+            if (!Array.isArray(data.detections) || data.detections.length === 0) {
+                resultsEl.innerHTML = '<p>No detections above the configured threshold.</p>';
+                return;
+            }
+
+            const fragment = tableTpl.content.cloneNode(true);
+            const tbody = fragment.querySelector('tbody');
+
+            data.detections.forEach((det, index) => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${index + 1}</td>
+                    <td>${det.frame_index}</td>
+                    <td>${det.label || 'n/a'}</td>
+                    <td>${det.score.toFixed(3)}</td>
+                    <td>${det.bbox.x}, ${det.bbox.y}, ${det.bbox.width}, ${det.bbox.height}</td>
+                    <td>${det.area}</td>
+                `;
+                tbody.appendChild(row);
+            });
+
+            resultsEl.innerHTML = '';
+            resultsEl.appendChild(fragment);
+        }
+
+        function delay(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+    </script>
+</body>
+</html>
