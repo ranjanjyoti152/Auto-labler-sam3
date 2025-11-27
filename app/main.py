@@ -34,6 +34,31 @@ BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "web" / "templates"))
 
 app = FastAPI(title="SAM3 Object Detector", version="0.1.0")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize detector and create required directories on startup."""
+    print("[STARTUP] Initializing SAM3 Auto Labeler...")
+    settings = get_settings()
+    
+    # Create required directories
+    required_dirs = [Path("./weights"), Path("./logs")]
+    for d in required_dirs:
+        d.mkdir(parents=True, exist_ok=True)
+        print(f"[STARTUP] Directory ensured: {d}")
+    
+    # Pre-load the detector (downloads model if not available)
+    print("[STARTUP] Loading SAM3 model (this may take a while on first run)...")
+    try:
+        _ = _get_detector()
+        print("[STARTUP] SAM3 model loaded successfully!")
+    except Exception as e:
+        print(f"[STARTUP] Warning: Failed to pre-load model: {e}")
+    
+    print("[STARTUP] Server ready to accept requests!")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, settings: Settings = Depends(get_settings)) -> HTMLResponse:
     return templates.TemplateResponse(

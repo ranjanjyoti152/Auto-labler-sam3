@@ -15,6 +15,17 @@ from PIL import Image
 from app.core.config import Settings
 
 
+def _ensure_directories() -> None:
+    """Create required directories if they don't exist."""
+    dirs = [
+        Path("./weights"),
+        Path("./logs"),
+    ]
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+        print(f"[INIT] Directory ensured: {d}")
+
+
 def _is_missing_sam3_sam(exc: ModuleNotFoundError) -> bool:
     missing = getattr(exc, "name", "") or ""
     return missing == "sam3.sam" or missing.startswith("sam3.sam.")
@@ -221,6 +232,9 @@ class Sam3Detector:
     """Text-prompted SAM3 detector that returns per-concept bounding boxes."""
 
     def __init__(self, settings: Settings) -> None:
+        # Ensure required directories exist
+        _ensure_directories()
+        
         self.settings = settings
         preferred = settings.device.lower()
         if preferred == "cuda" and not torch.cuda.is_available():
@@ -249,14 +263,29 @@ class Sam3Detector:
             os.environ.setdefault("HUGGINGFACEHUB_API_TOKEN", self.settings.hf_token)
 
         checkpoint = self.settings.checkpoint_path
+        checkpoint_path = Path(checkpoint) if checkpoint else None
+        
+        # Check if checkpoint exists, if not download from HuggingFace
+        load_from_hf = checkpoint_path is None or not checkpoint_path.exists()
+        
+        if load_from_hf:
+            print(f"[INIT] Model checkpoint not found locally. Downloading from HuggingFace...")
+            if checkpoint_path:
+                print(f"[INIT] Will save to: {checkpoint_path}")
+        else:
+            print(f"[INIT] Loading model from local checkpoint: {checkpoint_path}")
+        
         model = build_sam3_image_model(
-            checkpoint_path=checkpoint,
-            load_from_HF=checkpoint is None,
+            checkpoint_path=checkpoint if not load_from_hf else None,
+            load_from_HF=load_from_hf,
             device=str(self.device),
             eval_mode=True,
             enable_segmentation=True,
             enable_inst_interactivity=False,
         )
+        
+        print(f"[INIT] SAM3 model loaded successfully on {self.device}")
+        
         self._processor = Sam3Processor(
             model=model,
             device=str(self.device),
