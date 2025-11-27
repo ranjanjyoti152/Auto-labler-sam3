@@ -303,8 +303,7 @@ class Sam3Detector:
             concepts.extend(self._split_extra_prompts(self.settings.extra_concepts))
 
         deduped = self._dedupe(concepts)
-        if not deduped:
-            raise RuntimeError("No SAM3 concepts configured. Provide defaults or a concepts file.")
+        # Allow empty concepts - they will be provided at runtime from Label Studio
         return deduped
 
     def _read_concepts_from_file(self, path: str) -> List[str]:

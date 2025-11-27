@@ -7,8 +7,103 @@ FastAPI + Uvicorn microservice that samples frames from an RTSP stream and runs 
 - OpenCV-powered RTSP sampler with timeout protection and configurable frame skipping.
 - Official `facebookresearch/sam3` integration for open-vocabulary detections (COCO + safety prompts by default).
 - Live MJPEG preview (`GET /live-stream`) that restreams RTSP frames with detections drawn on every frame.
-- Label Studio-compatible ML backend endpoint (`POST /label-studio/predict`) for human-in-the-loop workflows.
+- Label Studio-compatible ML backend endpoint (`POST /predict`) for human-in-the-loop workflows.
+- **YOLO Dataset Preparation Tool** - Auto-label images from Label Studio using SAM3 and export to YOLO format.
 - Health probe (`GET /healthz`) for liveness checks.
+
+## YOLO Dataset Preparation Tool
+
+A powerful command-line tool to create YOLO-format datasets from Label Studio projects with SAM3 auto-labeling support.
+
+### Features
+- Fetches images from Label Studio projects (streaming, one-by-one)
+- Auto-labels images using SAM3 detection server
+- Converts annotations to YOLO format
+- Splits dataset into train/val/test sets
+- Generates `dataset.yaml` for YOLO training
+- Saves preview images with bounding boxes for verification
+- Progress bars with colored output and statistics
+
+### Usage
+
+```bash
+# Basic usage with auto-labeling
+python tools/prepare_yolo_dataset.py -p PROJECT_ID --auto-label -o ./datasets/mydata
+
+# Use existing Label Studio annotations
+python tools/prepare_yolo_dataset.py -p PROJECT_ID --use-existing -o ./datasets/mydata
+
+# Auto-label with preview images (to verify detection quality)
+python tools/prepare_yolo_dataset.py -p PROJECT_ID --auto-label -o ./datasets/mydata \
+  --save-preview --max-tasks 20 --sam3-url http://localhost:8080
+
+# Full example with all options
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --auto-label \
+  -o ./datasets/traffic \
+  --force \
+  --sam3-url http://localhost:8080 \
+  --save-preview \
+  --max-tasks 100 \
+  --train-split 0.8 \
+  --val-split 0.15 \
+  --test-split 0.05
+```
+
+### Options
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `-p, --project-id` | Label Studio project ID (required) | - |
+| `-o, --output-dir` | Output directory for YOLO dataset (required) | - |
+| `--ls-url` | Label Studio URL | From `.env` |
+| `--ls-token` | Label Studio API token | From `.env` |
+| `--sam3-url` | SAM3 server URL | `http://localhost:8000` |
+| `--use-existing` | Use existing annotations from Label Studio | `false` |
+| `--auto-label` | Auto-label images using SAM3 | `false` |
+| `--save-preview` | Save labeled preview images to `~/labeled_previews` | `false` |
+| `--max-tasks` | Maximum tasks to process (0 = all) | `0` |
+| `--train-split` | Train split ratio | `0.8` |
+| `--val-split` | Validation split ratio | `0.15` |
+| `--test-split` | Test split ratio | `0.05` |
+| `--force` | Overwrite existing output directory | `false` |
+
+### SAM3 Detection Configuration
+
+The tool reads SAM3 configuration from `.env` file for better detection quality:
+
+```env
+SAM3_SCORE_THRESHOLD=0.35    # Lower = more detections
+SAM3_NMS_THRESHOLD=0.3       # Non-max suppression threshold
+SAM3_MIN_BOX_AREA=500        # Minimum bounding box area (pixels)
+SAM3_MAX_DETECTIONS=250      # Max detections per image
+SAM3_CROSS_CLASS_NMS=true    # Cross-class NMS to reduce duplicates
+```
+
+### Output Structure
+
+```
+datasets/mydata/
+├── train/
+│   ├── images/
+│   └── labels/
+├── val/
+│   ├── images/
+│   └── labels/
+├── test/
+│   ├── images/
+│   └── labels/
+└── dataset.yaml
+```
+
+### Train YOLO Model
+
+After preparing the dataset:
+
+```bash
+yolo detect train data=./datasets/mydata/dataset.yaml model=yolov8n.pt epochs=100
+```
 
 ## Prerequisites
 1. Python 3.10+
