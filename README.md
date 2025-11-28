@@ -97,6 +97,19 @@ datasets/mydata/
 └── dataset.yaml
 ```
 
+### Sample Detection Previews
+
+Here are some sample preview images showing SAM3 auto-labeling results with bounding boxes:
+
+![Sample Detection 1](Samples/1b7807a9-c23e00c5-cd287494-frame_20250130_154302_970999_276157_preview.jpg)
+*Traffic scene with detected vehicles and objects*
+
+![Sample Detection 2](Samples/1c88d094-cb3e0a2e-317f28ae-frame_20250204_115056_401594_277218_preview.jpg)
+*Street view with auto-detected objects*
+
+![Sample Detection 3](Samples/1f0e9719-87f42632-0969a89f-autorickshow_1739261914622_278218_preview.jpg)
+*Auto-rickshaw detection example*
+
 ### Train YOLO Model
 
 After preparing the dataset:
