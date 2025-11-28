@@ -105,7 +105,7 @@ Here are some sample preview images showing SAM3 auto-labeling results with boun
 *Traffic scene with detected vehicles and objects*
 
 ![Sample Detection 2](Samples/1c88d094-cb3e0a2e-317f28ae-frame_20250204_115056_401594_277218_preview.jpg)
-*Street view with auto-detected objects*
+*Indoor with auto-detected objects*
 
 ![Sample Detection 3](Samples/1f0e9719-87f42632-0969a89f-autorickshow_1739261914622_278218_preview.jpg)
 *Auto-rickshaw detection example*
