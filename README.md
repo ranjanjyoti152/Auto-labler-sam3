@@ -1,242 +1,264 @@
-# SAM3 RTSP Object Detection API
+<p align="center">
+  <img src="https://img.shields.io/badge/SAM3-Auto%20Labeler-blueviolet?style=for-the-badge&logo=meta" alt="SAM3 Auto Labeler"/>
+</p>
 
-FastAPI + Uvicorn microservice that samples frames from an RTSP stream and runs Meta's SAM3 "Segment Anything with Concepts" model for open-vocabulary object detections (COCO + industrial safety prompts out of the box).
+<h1 align="center">🎯 SAM3 Auto-Labeler & YOLO Dataset Generator</h1>
 
-## Features
-- REST endpoint (`POST /detect`) for per-request RTSP inference with optional concept overrides.
-- OpenCV-powered RTSP sampler with timeout protection and configurable frame skipping.
-- Official `facebookresearch/sam3` integration for open-vocabulary detections (COCO + safety prompts by default).
-- Live MJPEG preview (`GET /live-stream`) that restreams RTSP frames with detections drawn on every frame.
-- Label Studio-compatible ML backend endpoint (`POST /predict`) for human-in-the-loop workflows.
-- **YOLO Dataset Preparation Tool** - Auto-label images from Label Studio using SAM3 and export to YOLO format.
-- Health probe (`GET /healthz`) for liveness checks.
+<p align="center">
+  <strong>Transform your unlabeled images into production-ready YOLO datasets in minutes, not hours.</strong>
+</p>
 
-## YOLO Dataset Preparation Tool
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-features">Features</a> •
+  <a href="#-yolo-dataset-tool">YOLO Tool</a> •
+  <a href="#-api-reference">API</a> •
+  <a href="#-contributing">Contributing</a>
+</p>
 
-A powerful command-line tool to create YOLO-format datasets from Label Studio projects with SAM3 auto-labeling support.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10+-blue.svg?style=flat-square&logo=python" alt="Python 3.10+"/>
+  <img src="https://img.shields.io/badge/PyTorch-2.7.0-ee4c2c.svg?style=flat-square&logo=pytorch" alt="PyTorch"/>
+  <img src="https://img.shields.io/badge/FastAPI-0.100+-009688.svg?style=flat-square&logo=fastapi" alt="FastAPI"/>
+  <img src="https://img.shields.io/badge/CUDA-12.6-76B900.svg?style=flat-square&logo=nvidia" alt="CUDA"/>
+  <img src="https://img.shields.io/github/license/ranjanjyoti152/Auto-labler-sam3?style=flat-square" alt="License"/>
+  <img src="https://img.shields.io/github/stars/ranjanjyoti152/Auto-labler-sam3?style=flat-square" alt="Stars"/>
+</p>
 
-### Features
-- Fetches images from Label Studio projects (streaming, one-by-one)
-- **Batch processing** with parallel downloads for 3-5x faster processing
-- Auto-labels images using SAM3 detection server
-- Converts annotations to YOLO format
-- Splits dataset into train/val/test sets
-- Generates `dataset.yaml` for YOLO training
-- Saves preview images with bounding boxes for verification
-- Progress bars with colored output and statistics
+---
 
-### Usage
+## 🌟 Why This Project?
 
-```bash
-# Basic usage with auto-labeling
-python tools/prepare_yolo_dataset.py -p PROJECT_ID --auto-label -o ./datasets/mydata
+Manual labeling is **slow**, **expensive**, and **error-prone**. This project leverages Meta's **SAM3 (Segment Anything Model 3)** to automatically detect and label objects in your images with incredible accuracy.
 
-# Use existing Label Studio annotations
-python tools/prepare_yolo_dataset.py -p PROJECT_ID --use-existing -o ./datasets/mydata
+| Traditional Labeling | SAM3 Auto-Labeler |
+|---------------------|-------------------|
+| ⏱️ Hours per 100 images | ⚡ Minutes per 1000 images |
+| 💰 $0.05-0.10 per label | 🆓 Free (self-hosted) |
+| 😓 Human fatigue errors | 🎯 Consistent AI accuracy |
+| 📦 Single format output | 🔄 YOLO-ready datasets |
 
-# Auto-label with preview images (to verify detection quality)
-python tools/prepare_yolo_dataset.py -p PROJECT_ID --auto-label -o ./datasets/mydata \
-  --save-preview --max-tasks 20 --sam3-url http://localhost:8080
+---
 
-# Full example with all options
-python tools/prepare_yolo_dataset.py \
-  -p 1 \
-  --auto-label \
-  -o ./datasets/traffic \
-  --force \
-  --sam3-url http://localhost:8080 \
-  --save-preview \
-  --max-tasks 100 \
-  --train-split 0.8 \
-  --val-split 0.15 \
-  --test-split 0.05
+## ✨ Features
 
-# Fast batch processing (recommended for large datasets)
-python tools/prepare_yolo_dataset.py \
-  -p 1 \
-  --auto-label \
-  -o ./datasets/traffic \
-  --force \
-  --batch-size 20 \
-  --workers 8
-```
+<table>
+<tr>
+<td width="50%">
 
-### Options
+### 🚀 Core Capabilities
+- **Open-Vocabulary Detection** - Detect ANY object by text prompt
+- **80+ COCO Classes** - Pre-configured out of the box
+- **Custom Concepts** - Add your own detection prompts
+- **Real-time RTSP** - Process live video streams
+- **Batch Processing** - 3-5x faster with parallel workers
 
-| Option | Description | Default |
-| --- | --- | --- |
-| `-p, --project-id` | Label Studio project ID (required) | - |
-| `-o, --output-dir` | Output directory for YOLO dataset (required) | - |
-| `--ls-url` | Label Studio URL | From `.env` |
-| `--ls-token` | Label Studio API token | From `.env` |
-| `--sam3-url` | SAM3 server URL | `http://localhost:8000` |
-| `--use-existing` | Use existing annotations from Label Studio | `false` |
-| `--auto-label` | Auto-label images using SAM3 | `false` |
-| `--save-preview` | Save labeled preview images to `~/labeled_previews` | `false` |
-| `--max-tasks` | Maximum tasks to process (0 = all) | `0` |
-| `--train-split` | Train split ratio | `0.8` |
-| `--val-split` | Validation split ratio | `0.15` |
-| `--test-split` | Test split ratio | `0.05` |
-| `--force` | Overwrite existing output directory | `false` |
-| `--batch-size` | Number of tasks per batch for parallel processing | `10` |
-| `--workers` | Number of parallel download workers | `4` |
-| `--no-batch` | Disable batch mode (process one-by-one) | `false` |
+</td>
+<td width="50%">
 
-### SAM3 Detection Configuration
+### 🔧 Integrations
+- **Label Studio** - ML backend for human-in-the-loop
+- **YOLO Export** - Ready for YOLOv8/v9/v10 training
+- **REST API** - Easy integration with any system
+- **MJPEG Stream** - Live preview with annotations
+- **Health Probes** - Kubernetes-ready deployment
 
-The tool reads SAM3 configuration from `.env` file for better detection quality:
+</td>
+</tr>
+</table>
 
-```env
-SAM3_SCORE_THRESHOLD=0.35    # Lower = more detections
-SAM3_NMS_THRESHOLD=0.3       # Non-max suppression threshold
-SAM3_MIN_BOX_AREA=500        # Minimum bounding box area (pixels)
-SAM3_MAX_DETECTIONS=250      # Max detections per image
-SAM3_CROSS_CLASS_NMS=true    # Cross-class NMS to reduce duplicates
-```
+---
 
-### Output Structure
+## 🚀 Quick Start
 
-```
-datasets/mydata/
-├── train/
-│   ├── images/
-│   └── labels/
-├── val/
-│   ├── images/
-│   └── labels/
-├── test/
-│   ├── images/
-│   └── labels/
-└── dataset.yaml
-```
-
-### Sample Detection Previews
-
-Here are some sample preview images showing SAM3 auto-labeling results with bounding boxes:
-
-![Sample Detection 1](Samples/1b7807a9-c23e00c5-cd287494-frame_20250130_154302_970999_276157_preview.jpg)
-*Traffic scene with detected vehicles and objects*
-
-![Sample Detection 2](Samples/1c88d094-cb3e0a2e-317f28ae-frame_20250204_115056_401594_277218_preview.jpg)
-*Indoor with auto-detected objects*
-
-![Sample Detection 3](Samples/1f0e9719-87f42632-0969a89f-autorickshow_1739261914622_278218_preview.jpg)
-*Auto-rickshaw detection example*
-
-### Train YOLO Model
-
-After preparing the dataset:
+### Prerequisites
 
 ```bash
-yolo detect train data=./datasets/mydata/dataset.yaml model=yolov8n.pt epochs=100
+# Python 3.10+ required
+python --version
+
+# Install PyTorch with CUDA (adjust for your CUDA version)
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
+  --index-url https://download.pytorch.org/whl/cu126
 ```
 
-## Prerequisites
-1. Python 3.10+
-2. PyTorch 2.7.0 with CUDA 12.6 (or CPU-only build) installed manually, e.g.
-   ```bash
-   pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
-     --index-url https://download.pytorch.org/whl/cu126
-  ```
+### Installation
 
-## Live stream preview
-- Endpoint: `GET /live-stream`
-- Required query parameter: `rtsp_url=rtsp://...`
-- Optional query parameters:
-  - `frame_skip` (defaults to `1`) to throttle how often detections/frames are emitted.
-  - Repeatable `concepts` parameters to override the default prompts (same limits as `/detect`).
-- Response: `multipart/x-mixed-replace` (MJPEG). Each JPEG has the detected bounding boxes, labels, and scores rendered directly on the frame.
-
-The index page automatically wires your form input to this endpoint and displays the MJPEG feed under the “Live stream preview” heading, so you can watch the annotated stream while the JSON results continue to refresh.
-
-## Label Studio ML backend
-
-- Endpoint: `POST /predict` (Label Studio’s default) — `/label-studio/predict` stays available for backward compatibility.
-- Body: `{ "tasks": [ { "id": "...", "data": { "rtsp_url": "rtsp://...", "frame_skip": 1, "concepts": ["person"] } } ] }`
-- Returns prediction objects that Label Studio can ingest directly. Each bounding box is emitted as a `rectanglelabels` result using `from_name="label"` and `to_name="image"`, so configure your project with matching control/input names.
-
-Example request:
 ```bash
-curl -X POST http://localhost:8000/label-studio/predict \
-  -H "Content-Type: application/json" \
-  -d '{
-        "tasks": [
-          {
-            "id": "task-1",
-            "data": {
-              "rtsp_url": "rtsp://192.168.1.50:8554/live",
-              "frame_skip": 1,
-              "concepts": ["person", "safety helmet"]
-            }
-          }
-        ]
-      }'
-```
+# Clone the repository
+git clone https://github.com/ranjanjyoti152/Auto-labler-sam3.git
+cd Auto-labler-sam3
 
-Register the backend in the Label Studio UI under *Settings → Machine Learning* by pointing to `http://<server>:8000/predict`. Use the same `from_name`/`to_name` pairing in your labeling config so the rectangles attach to the intended image or video node. (If you already configured `/label-studio/predict`, it will continue to work.)
-3. Hugging Face access to [`facebook/sam3`](https://huggingface.co/facebook/sam3) plus an access token saved as `SAM3_HF_TOKEN` (see `.env.example`).
-4. (Optional) Local checkpoint path if you prefer not to download from Hugging Face at runtime.
-
-## Installation
-```bash
+# Create virtual environment
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install dependencies
 pip install --upgrade pip
 pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your settings (HuggingFace token, Label Studio URL, etc.)
 ```
 
-## Configuration
-The server reads environment variables via `.env` (all variables are automatically prefixed with `SAM3_`). Key options:
+### Start the Server
 
-| Variable | Description | Default |
-| --- | --- | --- |
-| `SAM3_CHECKPOINT_PATH` | Optional path to a local `sam3.pt`. If omitted, the HF checkpoint is downloaded (requires token). | `None` |
-| `SAM3_HF_TOKEN` | Hugging Face token used when auto-downloading checkpoints. | `None` |
-| `SAM3_DEVICE` | `cuda` or `cpu`. Falls back to `cpu` if CUDA is unavailable. | `cuda` |
-| `SAM3_SCORE_THRESHOLD` | Minimum confidence score to keep detections. | `0.50` |
-| `SAM3_MAX_DETECTIONS` | Max detections returned per frame. | `25` |
-| `SAM3_RTSP_TIMEOUT` | Seconds to keep trying to read RTSP before aborting. | `5` |
-| `SAM3_FRAME_SKIP` | Frames skipped between samples (set to `1` for realtime). | `1` |
-| `SAM3_CONCEPTS_PATH` | Optional newline-delimited file listing concept prompts to run. Overrides defaults when set. | `None` |
-| `SAM3_EXTRA_CONCEPTS` | Comma-separated prompts appended after the defaults/file concepts. | `None` |
-| `SAM3_USE_DEFAULT_CONCEPTS` | `true/false` flag to include the built-in COCO + safety prompts. | `true` |
-| `SAM3_MAX_CONCEPTS_PER_REQUEST` | Safety guard for per-request concept overrides. | `160` |
-| `SAM3_LABELSTUDIO_FROM_NAME` | Label Studio control tag (`from_name`) to attach detections to. | `label` |
-| `SAM3_LABELSTUDIO_TO_NAME` | Label Studio object tag (`to_name`) that receives rectangle results. | `image` |
-| `SAM3_LABELSTUDIO_MODEL_VERSION` | Version string returned in Label Studio prediction responses. | `sam3-v0.1` |
-| `SAM3_LABELSTUDIO_API_BASE` | Base URL of your Label Studio instance (e.g., `http://10.10.18.20:8080`). | `None` |
-| `SAM3_LABELSTUDIO_API_TOKEN` | Personal access token used when calling the Label Studio REST API. | `None` |
-
-Example `.env`:
-```env
-SAM3_CHECKPOINT_PATH=./weights/sam3.pt
-SAM3_DEVICE=cuda
-SAM3_SCORE_THRESHOLD=0.5
-SAM3_MAX_DETECTIONS=25
-SAM3_FRAME_SKIP=1
-SAM3_EXTRA_CONCEPTS=fire alarm,worker without helmet
-```
-
-## Running the server
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Once the server is running, open `http://localhost:8000/` to use the built-in test page. Enter any RTSP URL, optional
-concept overrides, and start the polling loop to see detections refresh in near real-time.
+🎉 Open http://localhost:8000 to access the web interface!
 
-## Sample request
+---
+
+## 🎯 YOLO Dataset Preparation Tool
+
+<p align="center">
+  <strong>The fastest way to create YOLO datasets from Label Studio projects</strong>
+</p>
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| 📥 **Smart Fetching** | Streams images one-by-one (memory efficient) |
+| ⚡ **Batch Processing** | Parallel downloads for 3-5x speedup |
+| 🤖 **Auto-Labeling** | SAM3 automatically detects objects |
+| 📊 **Progress Tracking** | Beautiful CLI with stats & ETA |
+| 🖼️ **Preview Images** | Verify detections with visual previews |
+| 📁 **YOLO Format** | Ready for training with `dataset.yaml` |
+
+### Usage Examples
+
+```bash
+# 🚀 Quick auto-label (recommended)
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --auto-label \
+  -o ./datasets/my_project \
+  --force
+
+# ⚡ Fast batch processing for large datasets
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --auto-label \
+  -o ./datasets/my_project \
+  --batch-size 20 \
+  --workers 8
+
+# 🔍 With preview images for verification
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --auto-label \
+  -o ./datasets/my_project \
+  --save-preview \
+  --max-tasks 50
+
+# 📝 Use existing Label Studio annotations
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --use-existing \
+  -o ./datasets/my_project
+```
+
+### CLI Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-p, --project-id` | Label Studio project ID | *required* |
+| `-o, --output-dir` | Output directory for dataset | *required* |
+| `--auto-label` | Auto-label with SAM3 | `false` |
+| `--use-existing` | Use Label Studio annotations | `false` |
+| `--batch-size` | Tasks per batch | `10` |
+| `--workers` | Parallel download workers | `4` |
+| `--save-preview` | Save preview images | `false` |
+| `--max-tasks` | Limit tasks (0 = all) | `0` |
+| `--train-split` | Train ratio | `0.8` |
+| `--val-split` | Validation ratio | `0.15` |
+| `--test-split` | Test ratio | `0.05` |
+| `--force` | Overwrite existing output | `false` |
+| `--no-batch` | Disable batch mode | `false` |
+
+### Output Structure
+
+```
+datasets/my_project/
+├── 📁 train/
+│   ├── 📁 images/     # Training images
+│   └── 📁 labels/     # YOLO format labels
+├── 📁 val/
+│   ├── 📁 images/     # Validation images
+│   └── 📁 labels/     # YOLO format labels
+├── 📁 test/
+│   ├── 📁 images/     # Test images
+│   └── 📁 labels/     # YOLO format labels
+└── 📄 dataset.yaml    # YOLO training config
+```
+
+### Train Your Model
+
+```bash
+# Train YOLOv8 with your new dataset
+yolo detect train data=./datasets/my_project/dataset.yaml model=yolov8n.pt epochs=100
+
+# Or use YOLOv9/v10
+yolo detect train data=./datasets/my_project/dataset.yaml model=yolov9c.pt epochs=100
+```
+
+---
+
+## 📸 Sample Detection Previews
+
+<p align="center">
+  <em>SAM3 auto-labeling results with bounding boxes</em>
+</p>
+
+<table>
+<tr>
+<td align="center">
+<img src="Samples/1b7807a9-c23e00c5-cd287494-frame_20250130_154302_970999_276157_preview.jpg" width="300"/>
+<br/>
+<em>Traffic Scene Detection</em>
+</td>
+<td align="center">
+<img src="Samples/1c88d094-cb3e0a2e-317f28ae-frame_20250204_115056_401594_277218_preview.jpg" width="300"/>
+<br/>
+<em>Indoor Object Detection</em>
+</td>
+<td align="center">
+<img src="Samples/1f0e9719-87f42632-0969a89f-autorickshow_1739261914622_278218_preview.jpg" width="300"/>
+<br/>
+<em>Auto-Rickshaw Detection</em>
+</td>
+</tr>
+</table>
+
+---
+
+## 🔌 API Reference
+
+### Detection Endpoint
+
+```bash
+POST /detect
+```
+
+Analyze RTSP stream or image for objects.
+
 ```bash
 curl -X POST http://localhost:8000/detect \
   -H "Content-Type: application/json" \
   -d '{
-        "rtsp_url": "rtsp://192.168.1.50:8554/live",
-        "max_frames": 2,
-        "concepts": ["fire", "smoke", "safety helmet"]
-      }'
+    "rtsp_url": "rtsp://192.168.1.50:8554/live",
+    "max_frames": 2,
+    "concepts": ["fire", "smoke", "safety helmet"]
+  }'
 ```
 
-Sample response:
+<details>
+<summary>📤 Response Example</summary>
+
 ```json
 {
   "frames_analyzed": 2,
@@ -251,13 +273,253 @@ Sample response:
   ]
 }
 ```
+</details>
 
-## Concept prompts
-- By default the detector runs the 80 COCO classes plus a curated set of road-safety, industrial, fire, and PPE prompts (see `app/models/sam3_detector.py`).
-- Override the prompt list globally by pointing `SAM3_CONCEPTS_PATH` at a newline-separated file, or append ad-hoc prompts via `SAM3_EXTRA_CONCEPTS`.
-- You can also send a `concepts` array inside the `/detect` payload. The server enforces `SAM3_MAX_CONCEPTS_PER_REQUEST` to avoid runaway inference times.
+### Live Stream Preview
 
-## Notes
-- The detector uses Meta's official `facebookresearch/sam3` implementation. Make sure your environment satisfies the PyTorch/CUDA requirements listed above.
-- RTSP streams vary widely; if you need to throttle processing you can raise `frame_skip`, but the default `1` keeps every frame for realtime detection.
-- The published `sam3` wheel omits the `sam3.sam` subpackage, so this repo vendors those files under `third_party/sam3_patch`. Re-copy `sam3/sam` from upstream whenever you upgrade the dependency.
+```bash
+GET /live-stream?rtsp_url=rtsp://...&frame_skip=1
+```
+
+Returns MJPEG stream with real-time annotations.
+
+### Label Studio Integration
+
+```bash
+POST /predict
+```
+
+ML backend endpoint for Label Studio human-in-the-loop workflows.
+
+<details>
+<summary>📋 Example Request</summary>
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tasks": [
+      {
+        "id": "task-1",
+        "data": {
+          "rtsp_url": "rtsp://192.168.1.50:8554/live",
+          "frame_skip": 1,
+          "concepts": ["person", "safety helmet"]
+        }
+      }
+    ]
+  }'
+```
+</details>
+
+### Health Check
+
+```bash
+GET /healthz
+```
+
+Kubernetes-ready liveness probe.
+
+---
+
+## ⚙️ Configuration
+
+### Environment Variables
+
+Create a `.env` file with these settings:
+
+```env
+# 🔑 Required: HuggingFace token for SAM3 model
+SAM3_HF_TOKEN=your_hf_token_here
+
+# 🎯 Model Settings
+SAM3_CHECKPOINT_PATH=./weights/sam3.pt
+SAM3_DEVICE=cuda
+
+# 📊 Detection Thresholds
+SAM3_SCORE_THRESHOLD=0.35      # Lower = more detections
+SAM3_MAX_DETECTIONS=250        # Max boxes per image
+SAM3_MIN_BOX_AREA=500          # Filter small boxes
+SAM3_NMS_THRESHOLD=0.3         # Non-max suppression
+SAM3_CROSS_CLASS_NMS=true      # Remove cross-class overlaps
+
+# 🏷️ Label Studio Integration
+SAM3_LABELSTUDIO_API_BASE=http://your-labelstudio:8080
+SAM3_LABELSTUDIO_API_TOKEN=your_token_here
+
+# ⚡ Batch Processing
+YOLO_BATCH_SIZE=10
+YOLO_WORKERS=4
+```
+
+<details>
+<summary>📋 All Configuration Options</summary>
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SAM3_CHECKPOINT_PATH` | Local model path | `None` |
+| `SAM3_HF_TOKEN` | HuggingFace token | `None` |
+| `SAM3_DEVICE` | `cuda` or `cpu` | `cuda` |
+| `SAM3_SCORE_THRESHOLD` | Min detection confidence | `0.50` |
+| `SAM3_MAX_DETECTIONS` | Max detections per frame | `25` |
+| `SAM3_RTSP_TIMEOUT` | RTSP connection timeout | `5` |
+| `SAM3_FRAME_SKIP` | Frames to skip | `1` |
+| `SAM3_CONCEPTS_PATH` | Custom concepts file | `None` |
+| `SAM3_EXTRA_CONCEPTS` | Additional prompts | `None` |
+| `SAM3_USE_DEFAULT_CONCEPTS` | Use COCO classes | `true` |
+| `SAM3_MAX_CONCEPTS_PER_REQUEST` | Concept limit | `160` |
+| `SAM3_LABELSTUDIO_FROM_NAME` | LS control tag | `label` |
+| `SAM3_LABELSTUDIO_TO_NAME` | LS object tag | `image` |
+| `SAM3_LABELSTUDIO_MODEL_VERSION` | Model version string | `sam3-v0.1` |
+
+</details>
+
+---
+
+## 🏗️ Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Client Layer                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
+│  │ Web UI   │  │ REST API │  │  RTSP    │  │ Label Studio │   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └──────┬───────┘   │
+└───────┼─────────────┼─────────────┼───────────────┼────────────┘
+        │             │             │               │
+┌───────▼─────────────▼─────────────▼───────────────▼────────────┐
+│                     FastAPI Server (Uvicorn)                    │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
+│  │  /detect    │  │ /live-stream│  │      /predict           │ │
+│  └──────┬──────┘  └──────┬──────┘  └───────────┬─────────────┘ │
+└─────────┼────────────────┼─────────────────────┼───────────────┘
+          │                │                     │
+┌─────────▼────────────────▼─────────────────────▼───────────────┐
+│                     SAM3 Detection Engine                       │
+│  ┌──────────────┐  ┌───────────────┐  ┌──────────────────────┐ │
+│  │ COCO Classes │  │ Safety Prompts│  │  Custom Concepts     │ │
+│  │   (80+)      │  │  (PPE, Fire)  │  │   (User-defined)     │ │
+│  └──────────────┘  └───────────────┘  └──────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🤝 Contributing
+
+We love contributions! Here's how you can help make this project even better:
+
+### 🌈 Ways to Contribute
+
+| Type | Description |
+|------|-------------|
+| 🐛 **Bug Reports** | Found a bug? [Open an issue](https://github.com/ranjanjyoti152/Auto-labler-sam3/issues/new) |
+| 💡 **Feature Requests** | Have an idea? Let's discuss it! |
+| 📝 **Documentation** | Help improve our docs |
+| 🔧 **Code** | Submit a pull request |
+| ⭐ **Star** | Star this repo to show support! |
+
+### 🛠️ Development Setup
+
+```bash
+# Fork and clone
+git clone https://github.com/YOUR_USERNAME/Auto-labler-sam3.git
+cd Auto-labler-sam3
+
+# Create feature branch
+git checkout -b feature/amazing-feature
+
+# Make changes and test
+python -m pytest tests/
+
+# Commit and push
+git commit -m "Add amazing feature"
+git push origin feature/amazing-feature
+
+# Open a Pull Request!
+```
+
+### 📏 Code Style
+
+- Follow **PEP 8** guidelines
+- Add **docstrings** to functions
+- Write **tests** for new features
+- Update **README** for user-facing changes
+
+### 🎯 Good First Issues
+
+Looking for something to work on? Check out our [good first issues](https://github.com/ranjanjyoti152/Auto-labler-sam3/labels/good%20first%20issue)!
+
+---
+
+## 📊 Roadmap
+
+- [x] SAM3 integration with open-vocabulary detection
+- [x] RTSP stream processing
+- [x] Label Studio ML backend
+- [x] YOLO dataset generation tool
+- [x] Batch processing with parallel workers
+- [ ] 🐳 Docker image for easy deployment
+- [ ] ☸️ Kubernetes Helm chart
+- [ ] 🖥️ Web UI for dataset management
+- [ ] 🎬 Support for video file input
+- [ ] 🚀 Multi-GPU inference
+- [ ] 🎓 Model fine-tuning pipeline
+
+---
+
+## ❓ FAQ
+
+<details>
+<summary><b>Q: What hardware do I need?</b></summary>
+
+**A:** For best performance, use a GPU with at least 8GB VRAM. CPU-only mode works but is significantly slower.
+</details>
+
+<details>
+<summary><b>Q: Can I use custom detection prompts?</b></summary>
+
+**A:** Yes! Add prompts via `SAM3_EXTRA_CONCEPTS` in `.env` or pass them in API requests.
+</details>
+
+<details>
+<summary><b>Q: How do I integrate with Label Studio?</b></summary>
+
+**A:** Register the ML backend at `http://your-server:8000/predict` in Label Studio Settings → Machine Learning.
+</details>
+
+<details>
+<summary><b>Q: What YOLO versions are supported?</b></summary>
+
+**A:** The generated datasets work with YOLOv5, YOLOv8, YOLOv9, YOLOv10, and any YOLO-format compatible model.
+</details>
+
+---
+
+## 📜 License
+
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 🙏 Acknowledgments
+
+- [Meta AI](https://ai.meta.com/) for the incredible SAM3 model
+- [Ultralytics](https://ultralytics.com/) for YOLO
+- [Label Studio](https://labelstud.io/) for the annotation platform
+- All our amazing contributors! 💖
+
+---
+
+<p align="center">
+  <strong>Made with ❤️ for the Computer Vision Community</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/ranjanjyoti152/Auto-labler-sam3/stargazers">
+    <img src="https://img.shields.io/badge/⭐_Star_this_repo-if_it_helped_you!-yellow?style=for-the-badge" alt="Star"/>
+  </a>
+</p>
+
+<p align="center">
+  <sub>Built with 🔥 by <a href="https://github.com/ranjanjyoti152">@ranjanjyoti152</a></sub>
+</p>
