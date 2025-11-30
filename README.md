@@ -17,6 +17,7 @@ A powerful command-line tool to create YOLO-format datasets from Label Studio pr
 
 ### Features
 - Fetches images from Label Studio projects (streaming, one-by-one)
+- **Batch processing** with parallel downloads for 3-5x faster processing
 - Auto-labels images using SAM3 detection server
 - Converts annotations to YOLO format
 - Splits dataset into train/val/test sets
@@ -49,6 +50,15 @@ python tools/prepare_yolo_dataset.py \
   --train-split 0.8 \
   --val-split 0.15 \
   --test-split 0.05
+
+# Fast batch processing (recommended for large datasets)
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --auto-label \
+  -o ./datasets/traffic \
+  --force \
+  --batch-size 20 \
+  --workers 8
 ```
 
 ### Options
@@ -68,6 +78,9 @@ python tools/prepare_yolo_dataset.py \
 | `--val-split` | Validation split ratio | `0.15` |
 | `--test-split` | Test split ratio | `0.05` |
 | `--force` | Overwrite existing output directory | `false` |
+| `--batch-size` | Number of tasks per batch for parallel processing | `10` |
+| `--workers` | Number of parallel download workers | `4` |
+| `--no-batch` | Disable batch mode (process one-by-one) | `false` |
 
 ### SAM3 Detection Configuration
 

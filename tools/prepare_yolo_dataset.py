@@ -36,7 +36,9 @@ import random
 import time
 import base64
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -72,6 +74,10 @@ SAM3_NMS_THRESHOLD = float(os.environ.get("SAM3_NMS_THRESHOLD", "0.3"))
 SAM3_MIN_BOX_AREA = int(os.environ.get("SAM3_MIN_BOX_AREA", "500"))
 SAM3_MAX_DETECTIONS = int(os.environ.get("SAM3_MAX_DETECTIONS", "25"))
 SAM3_CROSS_CLASS_NMS = os.environ.get("SAM3_CROSS_CLASS_NMS", "true").lower() == "true"
+
+# Batch processing configuration
+DEFAULT_BATCH_SIZE = int(os.environ.get("YOLO_BATCH_SIZE", "10"))
+DEFAULT_WORKERS = int(os.environ.get("YOLO_WORKERS", "4"))
 
 
 class Colors:
@@ -129,7 +135,7 @@ def format_size(bytes: int) -> str:
 
 
 class Stats:
-    """Track processing statistics."""
+    """Track processing statistics (thread-safe)."""
     
     def __init__(self):
         self.start_time = time.time()
@@ -141,39 +147,71 @@ class Stats:
         self.total_annotations = 0
         self.total_bytes_downloaded = 0
         self.class_counts: Dict[str, int] = {}
+        self._lock = Lock()
     
     def add_annotations(self, count: int, labels: List[str]):
-        self.total_annotations += count
-        for label in labels:
-            self.class_counts[label] = self.class_counts.get(label, 0) + 1
+        with self._lock:
+            self.total_annotations += count
+            for label in labels:
+                self.class_counts[label] = self.class_counts.get(label, 0) + 1
+    
+    def add_bytes(self, bytes_count: int):
+        with self._lock:
+            self.total_bytes_downloaded += bytes_count
+    
+    def increment_success(self):
+        with self._lock:
+            self.processed += 1
+            self.success += 1
+    
+    def increment_skipped(self):
+        with self._lock:
+            self.processed += 1
+            self.skipped += 1
+    
+    def increment_failed(self):
+        with self._lock:
+            self.processed += 1
+            self.failed += 1
     
     def elapsed(self) -> float:
         return time.time() - self.start_time
     
     def eta(self) -> str:
-        if self.processed == 0:
+        with self._lock:
+            processed = self.processed
+        if processed == 0:
             return "calculating..."
         elapsed = self.elapsed()
-        rate = self.processed / elapsed
-        remaining = (self.total_tasks - self.processed) / rate
+        rate = processed / elapsed
+        remaining = (self.total_tasks - processed) / rate
         return format_time(remaining)
     
-    def print_progress(self, task_id: Any):
+    def print_progress(self, task_id: Any = None, batch_info: str = ""):
         """Print current progress."""
-        pct = (self.processed / self.total_tasks * 100) if self.total_tasks > 0 else 0
+        with self._lock:
+            processed = self.processed
+            success = self.success
+            skipped = self.skipped
+            failed = self.failed
+        
+        pct = (processed / self.total_tasks * 100) if self.total_tasks > 0 else 0
         elapsed = format_time(self.elapsed())
         eta = self.eta()
         
         # Create progress bar
         bar_width = 30
-        filled = int(bar_width * self.processed / self.total_tasks) if self.total_tasks > 0 else 0
+        filled = int(bar_width * processed / self.total_tasks) if self.total_tasks > 0 else 0
         bar = '█' * filled + '░' * (bar_width - filled)
         
         status = f"\r{Colors.CYAN}[{bar}]{Colors.ENDC} {pct:5.1f}% | "
-        status += f"Task: {task_id} | "
-        status += f"{Colors.GREEN}✓{self.success}{Colors.ENDC} "
-        status += f"{Colors.YELLOW}⊘{self.skipped}{Colors.ENDC} "
-        status += f"{Colors.RED}✗{self.failed}{Colors.ENDC} | "
+        if batch_info:
+            status += f"{batch_info} | "
+        elif task_id:
+            status += f"Task: {task_id} | "
+        status += f"{Colors.GREEN}✓{success}{Colors.ENDC} "
+        status += f"{Colors.YELLOW}⊘{skipped}{Colors.ENDC} "
+        status += f"{Colors.RED}✗{failed}{Colors.ENDC} | "
         status += f"⏱ {elapsed} | ETA: {eta}  "
         
         print(status, end='', flush=True)
@@ -260,6 +298,34 @@ class LabelStudioClient:
             if isinstance(data, dict) and data.get("next"):
                 page += 1
             elif len(batch) < page_size:
+                break
+            else:
+                page += 1
+
+    def iter_task_batches(self, project_id: int, batch_size: int = 10):
+        """Iterate over tasks in batches (generator yielding lists)."""
+        page = 1
+        while True:
+            url = f"{self.base_url}/api/projects/{project_id}/tasks"
+            params = {"page": page, "page_size": batch_size}
+            resp = requests.get(url, headers=self.headers, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if isinstance(data, list):
+                batch = data
+            else:
+                batch = data.get("tasks", data.get("results", []))
+            
+            if not batch:
+                break
+            
+            yield batch
+            
+            # Check if there are more pages
+            if isinstance(data, dict) and data.get("next"):
+                page += 1
+            elif len(batch) < batch_size:
                 break
             else:
                 page += 1
@@ -390,6 +456,66 @@ class SAM3Client:
             return results[0]["result"]
         
         return []
+
+    def predict_batch(self, images_base64: List[Tuple[int, str]], concepts: List[str]) -> Dict[int, List[Dict[str, Any]]]:
+        """
+        Batch prediction for multiple images.
+        
+        Args:
+            images_base64: List of (task_id, base64_image_data) tuples
+            concepts: List of concept labels to detect
+            
+        Returns:
+            Dict mapping task_id to list of detection results
+        """
+        # Build batch request
+        tasks = []
+        for task_id, img_b64 in images_base64:
+            if not img_b64.startswith("data:"):
+                img_b64 = f"data:image/jpeg;base64,{img_b64}"
+            
+            tasks.append({
+                "id": task_id,
+                "data": {
+                    "image": img_b64,
+                    "concepts": concepts,
+                    "score_threshold": self.score_threshold,
+                    "nms_threshold": self.nms_threshold,
+                    "min_box_area": self.min_box_area,
+                    "max_detections": self.max_detections,
+                    "cross_class_nms": self.cross_class_nms,
+                }
+            })
+        
+        payload = {"tasks": tasks}
+        
+        resp = requests.post(
+            f"{self.base_url}/predict",
+            json=payload,
+            timeout=300,  # Longer timeout for batch
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        
+        data = resp.json()
+        
+        # Parse response into dict by task_id
+        results_map = {}
+        
+        if "results" in data:
+            results_list = data["results"]
+        elif isinstance(data, list):
+            results_list = data
+        else:
+            results_list = [data]
+        
+        # Match results back to task IDs
+        for i, result in enumerate(results_list):
+            if i < len(images_base64):
+                task_id = images_base64[i][0]
+                results_map[task_id] = result.get("result", [])
+        
+        return results_map
 
 
 def parse_labels_from_config(label_config: str) -> List[str]:
@@ -545,6 +671,205 @@ def download_image(url: str, output_path: Path, headers: Dict[str, str] = None) 
     except Exception as e:
         print(f"\n  {Colors.RED}✗ Download failed: {e}{Colors.ENDC}")
         return 0
+
+
+def download_image_to_memory(url: str, headers: Dict[str, str] = None) -> Optional[bytes]:
+    """Download image to memory and return bytes."""
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.content
+    except Exception:
+        return None
+
+
+def process_task_download(
+    task: Dict[str, Any],
+    ls_client: LabelStudioClient,
+) -> Tuple[int, Optional[bytes], Optional[str], str]:
+    """
+    Download image for a task (thread-safe).
+    Returns (task_id, image_data, filename, status) tuple.
+    """
+    task_id = task.get("id", 0)
+    
+    # Get image URL
+    image_url = ls_client.get_image_url(task)
+    if not image_url:
+        return task_id, None, None, "no_image_url"
+    
+    # Skip invalid URLs
+    if not image_url.startswith(("http://", "https://")):
+        return task_id, None, None, "invalid_url"
+    
+    # Determine output filename
+    parsed = urlparse(image_url)
+    original_name = Path(parsed.path).stem
+    if not original_name or original_name in ["image", "img", "file"]:
+        original_name = f"task_{task_id}"
+    
+    # Add task_id to ensure uniqueness
+    filename = f"{original_name}_{task_id}"
+    
+    # Determine image extension
+    image_ext = Path(parsed.path).suffix or ".jpg"
+    if image_ext.lower() not in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
+        image_ext = ".jpg"
+    
+    filename_with_ext = f"{filename}{image_ext}"
+    
+    # Download image
+    image_data = download_image_to_memory(image_url, ls_client.headers)
+    if image_data is None:
+        return task_id, None, filename_with_ext, "download_failed"
+    
+    return task_id, image_data, filename_with_ext, "success"
+
+
+def process_batch(
+    tasks: List[Dict[str, Any]],
+    ls_client: LabelStudioClient,
+    sam3_client: Optional[SAM3Client],
+    images_dir: Path,
+    labels_dir: Path,
+    label_to_id: Dict[str, int],
+    use_existing: bool,
+    auto_label: bool,
+    stats: Stats,
+    project_labels: List[str] = None,
+    preview_dir: Optional[Path] = None,
+    num_workers: int = 4,
+) -> None:
+    """
+    Process a batch of tasks with parallel downloads and batch SAM3 prediction.
+    """
+    # Step 1: Download all images in parallel
+    downloaded = {}  # task_id -> (image_data, filename, task)
+    task_map = {t.get("id", i): t for i, t in enumerate(tasks)}
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(process_task_download, task, ls_client): task.get("id", i)
+            for i, task in enumerate(tasks)
+        }
+        
+        for future in as_completed(futures):
+            task_id, image_data, filename, status = future.result()
+            
+            if status == "success" and image_data is not None:
+                downloaded[task_id] = (image_data, filename, task_map[task_id])
+            else:
+                stats.increment_skipped()
+    
+    if not downloaded:
+        return
+    
+    # Step 2: Get existing annotations or prepare for auto-labeling
+    annotations_map = {}  # task_id -> list of annotations
+    need_auto_label = []  # list of (task_id, image_base64) for SAM3
+    
+    for task_id, (image_data, filename, task) in downloaded.items():
+        annotations = []
+        
+        if use_existing:
+            annotations = get_annotations_from_task(task)
+        
+        if annotations:
+            annotations_map[task_id] = annotations
+        elif auto_label and sam3_client:
+            # Queue for batch auto-labeling
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            need_auto_label.append((task_id, image_base64))
+        else:
+            # No annotations and no auto-label - mark as skipped
+            stats.increment_skipped()
+    
+    # Step 3: Batch SAM3 prediction for tasks needing auto-labeling
+    if need_auto_label and sam3_client:
+        concepts = project_labels or list(label_to_id.keys())
+        try:
+            sam3_results = sam3_client.predict_batch(need_auto_label, concepts)
+            
+            for task_id, results in sam3_results.items():
+                annotations = []
+                for result in results:
+                    value = result.get("value", {})
+                    labels = value.get("rectanglelabels", [])
+                    if labels:
+                        annotations.append({
+                            "label": labels[0],
+                            "x": value.get("x", 0),
+                            "y": value.get("y", 0),
+                            "width": value.get("width", 0),
+                            "height": value.get("height", 0),
+                        })
+                
+                if annotations:
+                    annotations_map[task_id] = annotations
+                else:
+                    stats.increment_skipped()
+                    
+        except requests.exceptions.ConnectionError:
+            for task_id, _ in need_auto_label:
+                stats.increment_failed()
+        except requests.exceptions.Timeout:
+            for task_id, _ in need_auto_label:
+                stats.increment_failed()
+        except Exception as e:
+            for task_id, _ in need_auto_label:
+                stats.increment_failed()
+    
+    # Step 4: Save images and labels (can be done in parallel)
+    def save_task(task_id: int) -> Tuple[bool, str]:
+        if task_id not in downloaded or task_id not in annotations_map:
+            return False, "missing_data"
+        
+        image_data, filename, task = downloaded[task_id]
+        annotations = annotations_map[task_id]
+        
+        # Convert to YOLO format
+        yolo_lines = convert_to_yolo_format(annotations, label_to_id)
+        if not yolo_lines:
+            return False, "no_valid_boxes"
+        
+        # Save image
+        image_path = images_dir / filename
+        with open(image_path, "wb") as f:
+            f.write(image_data)
+        
+        # Save labels
+        stem = Path(filename).stem
+        label_path = labels_dir / f"{stem}.txt"
+        with open(label_path, "w") as f:
+            f.write("\n".join(yolo_lines))
+        
+        # Save preview image with bounding boxes
+        if preview_dir is not None:
+            preview_data = draw_preview_image(image_data, annotations, label_to_id)
+            if preview_data:
+                preview_path = preview_dir / f"{stem}_preview.jpg"
+                with open(preview_path, "wb") as f:
+                    f.write(preview_data)
+        
+        # Update stats
+        stats.add_bytes(len(image_data))
+        labels_in_task = [ann["label"] for ann in annotations if ann["label"] in label_to_id]
+        stats.add_annotations(len(yolo_lines), labels_in_task)
+        
+        return True, "success"
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(save_task, task_id): task_id
+            for task_id in annotations_map.keys()
+        }
+        
+        for future in as_completed(futures):
+            success, reason = future.result()
+            if success:
+                stats.increment_success()
+            else:
+                stats.increment_skipped()
 
 
 def process_task(
@@ -781,6 +1106,12 @@ Examples:
                         help="Save labeled preview images to ~/labeled_previews")
     parser.add_argument("--max-tasks", type=int, default=0,
                         help="Maximum number of tasks to process (0 = all)")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                        help=f"Number of tasks to process per batch (default: {DEFAULT_BATCH_SIZE})")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"Number of parallel workers for downloads (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--no-batch", action="store_true",
+                        help="Disable batch processing (process one-by-one)")
     
     args = parser.parse_args()
     
@@ -807,6 +1138,7 @@ Examples:
   Use Existing:    {'Yes' if args.use_existing else 'No'}
   Auto-Label:      {'Yes' if args.auto_label else 'No'}
   Split Ratio:     train={args.train_split}, val={args.val_split}, test={args.test_split}
+  Batch Mode:      {'Disabled' if args.no_batch else f'Yes (batch_size={args.batch_size}, workers={args.workers})'}
 """)
     
     if args.auto_label:
@@ -900,57 +1232,95 @@ Examples:
     temp_labels_dir.mkdir(parents=True, exist_ok=True)
     
     # Process tasks
-    print_section("Processing Tasks (Streaming)")
+    print_section("Processing Tasks" + (" (Batch Mode)" if not args.no_batch else " (Sequential)"))
     if args.auto_label:
         concepts_preview = ", ".join(labels[:5])
         if len(labels) > 5:
             concepts_preview += "..."
         print(f"{Colors.CYAN}ℹ Auto-labeling with {len(labels)} concepts: {concepts_preview}{Colors.ENDC}")
     
+    if not args.no_batch:
+        print(f"{Colors.CYAN}ℹ Batch size: {args.batch_size}, Workers: {args.workers}{Colors.ENDC}")
+    
     stats = Stats()
     stats.total_tasks = total_tasks
     
     print()  # Empty line for progress bar
     
-    # Process tasks one by one (streaming from Label Studio)
-    tasks_processed = 0
-    for task in ls_client.iter_tasks(args.project_id, page_size=1):
-        # Check max_tasks limit
-        if args.max_tasks > 0 and tasks_processed >= args.max_tasks:
-            break
-        
-        task_id = task.get('id', 'unknown')
-        
-        success, reason = process_task(
-            task,
-            ls_client,
-            sam3_client,
-            temp_images_dir,
-            temp_labels_dir,
-            label_to_id,
-            args.use_existing,
-            args.auto_label,
-            stats,
-            project_labels=labels,
-            preview_dir=preview_dir,
-        )
-        
-        tasks_processed += 1
-        stats.processed += 1
-        if success:
-            stats.success += 1
-        elif reason in ("no_annotations", "no_valid_boxes", "no_image_url", "download_failed", "invalid_url"):
-            stats.skipped += 1
-        elif reason and reason.startswith("sam3_"):
-            # SAM3 related errors - these are failures, not skips
-            stats.failed += 1
-            print(f"\n  {Colors.RED}✗ Task {task_id}: {reason}{Colors.ENDC}")
-        else:
-            stats.failed += 1
-            if reason:
+    if args.no_batch:
+        # Legacy one-by-one processing
+        tasks_processed = 0
+        for task in ls_client.iter_tasks(args.project_id, page_size=1):
+            # Check max_tasks limit
+            if args.max_tasks > 0 and tasks_processed >= args.max_tasks:
+                break
+            
+            task_id = task.get('id', 'unknown')
+            
+            success, reason = process_task(
+                task,
+                ls_client,
+                sam3_client,
+                temp_images_dir,
+                temp_labels_dir,
+                label_to_id,
+                args.use_existing,
+                args.auto_label,
+                stats,
+                project_labels=labels,
+                preview_dir=preview_dir,
+            )
+            
+            tasks_processed += 1
+            stats.processed += 1
+            if success:
+                stats.success += 1
+            elif reason in ("no_annotations", "no_valid_boxes", "no_image_url", "download_failed", "invalid_url"):
+                stats.skipped += 1
+            elif reason and reason.startswith("sam3_"):
+                # SAM3 related errors - these are failures, not skips
+                stats.failed += 1
                 print(f"\n  {Colors.RED}✗ Task {task_id}: {reason}{Colors.ENDC}")
+            else:
+                stats.failed += 1
+                if reason:
+                    print(f"\n  {Colors.RED}✗ Task {task_id}: {reason}{Colors.ENDC}")
+            
+            stats.print_progress(task_id)
+    else:
+        # Batch processing mode
+        batch_num = 0
+        tasks_processed = 0
         
-        stats.print_progress(task_id)
+        for batch in ls_client.iter_task_batches(args.project_id, batch_size=args.batch_size):
+            # Check max_tasks limit
+            if args.max_tasks > 0:
+                remaining = args.max_tasks - tasks_processed
+                if remaining <= 0:
+                    break
+                if len(batch) > remaining:
+                    batch = batch[:remaining]
+            
+            batch_num += 1
+            batch_info = f"Batch {batch_num} ({len(batch)} tasks)"
+            
+            process_batch(
+                batch,
+                ls_client,
+                sam3_client,
+                temp_images_dir,
+                temp_labels_dir,
+                label_to_id,
+                args.use_existing,
+                args.auto_label,
+                stats,
+                project_labels=labels,
+                preview_dir=preview_dir,
+                num_workers=args.workers,
+            )
+            
+            tasks_processed += len(batch)
+            stats.print_progress(batch_info=batch_info)
     
     print()  # New line after progress bar
     
