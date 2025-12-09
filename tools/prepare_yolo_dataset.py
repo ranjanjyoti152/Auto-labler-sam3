@@ -257,29 +257,87 @@ class LabelStudioClient:
     def __init__(self, base_url: str, api_token: str):
         self.base_url = base_url.rstrip("/")
         self.headers = {"Authorization": f"Token {api_token}"}
+        # Create a session for connection pooling (faster for multiple requests)
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
 
     def get_project(self, project_id: int) -> Dict[str, Any]:
         """Get project details including label config."""
         url = f"{self.base_url}/api/projects/{project_id}"
-        resp = requests.get(url, headers=self.headers)
+        resp = self.session.get(url)
         resp.raise_for_status()
         return resp.json()
 
     def get_task_count(self, project_id: int) -> int:
         """Get total number of tasks in project."""
         url = f"{self.base_url}/api/projects/{project_id}"
-        resp = requests.get(url, headers=self.headers)
+        resp = self.session.get(url)
         resp.raise_for_status()
         data = resp.json()
         return data.get("task_number", 0)
 
+    def get_all_tasks(self, project_id: int, max_tasks: int = 0, show_progress: bool = True) -> List[Dict[str, Any]]:
+        """Fetch ALL tasks at once with large page size for efficiency."""
+        all_tasks = []
+        page = 1
+        page_size = 100  # Fetch 100 at a time
+        
+        # Get total count first for progress bar
+        total_count = self.get_task_count(project_id)
+        if max_tasks > 0:
+            total_count = min(total_count, max_tasks)
+        
+        while True:
+            url = f"{self.base_url}/api/projects/{project_id}/tasks"
+            params = {"page": page, "page_size": page_size}
+            resp = self.session.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if isinstance(data, list):
+                batch = data
+            else:
+                batch = data.get("tasks", data.get("results", []))
+            
+            if not batch:
+                break
+            
+            all_tasks.extend(batch)
+            
+            # Show progress bar
+            if show_progress:
+                fetched = len(all_tasks)
+                pct = (fetched / total_count * 100) if total_count > 0 else 100
+                bar_width = 30
+                filled = int(bar_width * fetched / total_count) if total_count > 0 else bar_width
+                bar = '█' * filled + '░' * (bar_width - filled)
+                print(f"\r  {Colors.CYAN}[{bar}]{Colors.ENDC} {pct:5.1f}% | Fetched {fetched}/{total_count} tasks", end='', flush=True)
+            
+            # Check max_tasks limit
+            if max_tasks > 0 and len(all_tasks) >= max_tasks:
+                all_tasks = all_tasks[:max_tasks]
+                break
+            
+            # Check if there are more pages
+            if isinstance(data, dict) and data.get("next"):
+                page += 1
+            elif len(batch) < page_size:
+                break
+            else:
+                page += 1
+        
+        if show_progress:
+            print()  # New line after progress bar
+        
+        return all_tasks
+
     def iter_tasks(self, project_id: int, page_size: int = 1):
-        """Iterate over tasks one by one (generator)."""
+        """Iterate over tasks one by one (generator) - legacy method."""
         page = 1
         while True:
             url = f"{self.base_url}/api/projects/{project_id}/tasks"
             params = {"page": page, "page_size": page_size}
-            resp = requests.get(url, headers=self.headers, params=params)
+            resp = self.session.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
             
@@ -308,7 +366,7 @@ class LabelStudioClient:
         while True:
             url = f"{self.base_url}/api/projects/{project_id}/tasks"
             params = {"page": page, "page_size": batch_size}
-            resp = requests.get(url, headers=self.headers, params=params)
+            resp = self.session.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
             
@@ -655,10 +713,11 @@ def draw_preview_image(
         return None
 
 
-def download_image(url: str, output_path: Path, headers: Dict[str, str] = None) -> int:
+def download_image(url: str, output_path: Path, headers: Dict[str, str] = None, session: requests.Session = None) -> int:
     """Download image and return bytes downloaded."""
     try:
-        resp = requests.get(url, headers=headers, timeout=30, stream=True)
+        requester = session if session else requests
+        resp = requester.get(url, headers=headers, timeout=30, stream=True)
         resp.raise_for_status()
         
         total_bytes = 0
@@ -673,10 +732,11 @@ def download_image(url: str, output_path: Path, headers: Dict[str, str] = None) 
         return 0
 
 
-def download_image_to_memory(url: str, headers: Dict[str, str] = None) -> Optional[bytes]:
+def download_image_to_memory(url: str, headers: Dict[str, str] = None, session: requests.Session = None) -> Optional[bytes]:
     """Download image to memory and return bytes."""
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
+        requester = session if session else requests
+        resp = requester.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         return resp.content
     except Exception:
@@ -688,7 +748,7 @@ def process_task_download(
     ls_client: LabelStudioClient,
 ) -> Tuple[int, Optional[bytes], Optional[str], str]:
     """
-    Download image for a task (thread-safe).
+    Download image for a task (thread-safe, uses connection pooling).
     Returns (task_id, image_data, filename, status) tuple.
     """
     task_id = task.get("id", 0)
@@ -718,8 +778,8 @@ def process_task_download(
     
     filename_with_ext = f"{filename}{image_ext}"
     
-    # Download image
-    image_data = download_image_to_memory(image_url, ls_client.headers)
+    # Download image using session for connection pooling
+    image_data = download_image_to_memory(image_url, session=ls_client.session)
     if image_data is None:
         return task_id, None, filename_with_ext, "download_failed"
     
@@ -1185,18 +1245,27 @@ Examples:
     
     label_to_id = {label: i for i, label in enumerate(labels)}
     
-    # Get task count (not all tasks at once)
-    print_section("Checking Tasks")
+    # Fetch all tasks with progress bar
+    print_section("Fetching Tasks from Label Studio")
     try:
         total_tasks = ls_client.get_task_count(args.project_id)
-        # Apply max_tasks limit if specified
+        print(f"{Colors.CYAN}ℹ Project has {total_tasks} total tasks{Colors.ENDC}")
+        
         if args.max_tasks > 0:
-            total_tasks = min(total_tasks, args.max_tasks)
-            print(f"{Colors.GREEN}✓ Found tasks, will process {total_tasks} (limited by --max-tasks){Colors.ENDC}")
-        else:
-            print(f"{Colors.GREEN}✓ Found {total_tasks} tasks (will fetch one by one){Colors.ENDC}")
+            print(f"{Colors.CYAN}ℹ Will fetch up to {args.max_tasks} tasks (--max-tasks){Colors.ENDC}")
+        
+        print(f"{Colors.CYAN}ℹ Fetching tasks...{Colors.ENDC}")
+        all_tasks = ls_client.get_all_tasks(args.project_id, max_tasks=args.max_tasks, show_progress=True)
+        print(f"{Colors.GREEN}✓ Fetched {len(all_tasks)} tasks successfully!{Colors.ENDC}")
+        
+        total_tasks = len(all_tasks)
+        if args.max_tasks > 0 and total_tasks > args.max_tasks:
+            all_tasks = all_tasks[:args.max_tasks]
+            total_tasks = args.max_tasks
+            print(f"{Colors.YELLOW}  (limited to {args.max_tasks} by --max-tasks){Colors.ENDC}")
+            
     except Exception as e:
-        print(f"{Colors.RED}✗ Failed to get task count: {e}{Colors.ENDC}")
+        print(f"{Colors.RED}✗ Failed to fetch tasks: {e}{Colors.ENDC}")
         sys.exit(1)
     
     if total_tasks == 0:
@@ -1248,13 +1317,9 @@ Examples:
     print()  # Empty line for progress bar
     
     if args.no_batch:
-        # Legacy one-by-one processing
+        # Legacy one-by-one processing (uses pre-fetched tasks)
         tasks_processed = 0
-        for task in ls_client.iter_tasks(args.project_id, page_size=1):
-            # Check max_tasks limit
-            if args.max_tasks > 0 and tasks_processed >= args.max_tasks:
-                break
-            
+        for task in all_tasks:
             task_id = task.get('id', 'unknown')
             
             success, reason = process_task(
@@ -1288,19 +1353,13 @@ Examples:
             
             stats.print_progress(task_id)
     else:
-        # Batch processing mode
+        # Batch processing mode - process pre-fetched tasks in chunks
         batch_num = 0
-        tasks_processed = 0
+        batch_size = args.batch_size
         
-        for batch in ls_client.iter_task_batches(args.project_id, batch_size=args.batch_size):
-            # Check max_tasks limit
-            if args.max_tasks > 0:
-                remaining = args.max_tasks - tasks_processed
-                if remaining <= 0:
-                    break
-                if len(batch) > remaining:
-                    batch = batch[:remaining]
-            
+        # Split all_tasks into batches
+        for i in range(0, len(all_tasks), batch_size):
+            batch = all_tasks[i:i + batch_size]
             batch_num += 1
             batch_info = f"Batch {batch_num} ({len(batch)} tasks)"
             
@@ -1319,7 +1378,6 @@ Examples:
                 num_workers=args.workers,
             )
             
-            tasks_processed += len(batch)
             stats.print_progress(batch_info=batch_info)
     
     print()  # New line after progress bar
