@@ -6,13 +6,53 @@ from typing import Dict, Iterable, List, Sequence
 import importlib.util
 import os
 import shutil
+import sys
 
 import cv2
 import numpy as np
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 from app.core.config import Settings
+
+
+def _get_bpe_path() -> str | None:
+    """Get the path to the BPE vocabulary file from various packages.
+    
+    The BPE vocabulary file is shared across multiple packages (sam3, clip, open_clip).
+    We try to find it from any available source.
+    """
+    search_packages = ["sam3", "clip", "open_clip"]
+    
+    for package_name in search_packages:
+        try:
+            spec = importlib.util.find_spec(package_name)
+            if spec is None:
+                continue
+            
+            # Handle namespace packages (origin is None)
+            if spec.origin:
+                package_dir = Path(spec.origin).resolve().parent
+            elif hasattr(spec, 'submodule_search_locations') and spec.submodule_search_locations:
+                # Use the first search location for namespace packages
+                package_dir = Path(list(spec.submodule_search_locations)[0])
+            else:
+                continue
+            
+            # Check for the BPE file in common locations
+            bpe_paths = [
+                package_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz",
+                package_dir / "bpe_simple_vocab_16e6.txt.gz",
+            ]
+            
+            for bpe_path in bpe_paths:
+                if bpe_path.exists():
+                    return str(bpe_path)
+        except Exception:
+            continue
+    
+    return None
 
 
 def _ensure_directories() -> None:
@@ -245,7 +285,7 @@ class Sam3Detector:
         self._processor: Sam3Processor | None = None
         self._default_concepts = self._build_default_concepts()
         self._build_processor()
-        
+
         # Enable inference optimizations
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
@@ -262,6 +302,13 @@ class Sam3Detector:
             os.environ["HF_TOKEN"] = self.settings.hf_token
             os.environ.setdefault("HUGGINGFACEHUB_API_TOKEN", self.settings.hf_token)
 
+        # Get BPE path explicitly to avoid pkg_resources issue
+        bpe_path = _get_bpe_path()
+        if bpe_path:
+            print(f"[INIT] Found BPE vocabulary at: {bpe_path}")
+        else:
+            print("[INIT] Warning: Could not locate BPE vocabulary file")
+
         checkpoint = self.settings.checkpoint_path
         checkpoint_path = Path(checkpoint) if checkpoint else None
         
@@ -269,13 +316,18 @@ class Sam3Detector:
         load_from_hf = checkpoint_path is None or not checkpoint_path.exists()
         
         if load_from_hf:
-            print(f"[INIT] Model checkpoint not found locally. Downloading from HuggingFace...")
+            print("[INIT] Model checkpoint not found locally. Downloading from HuggingFace...")
+            print("[INIT] This may take a while on first run (model is ~2GB)...")
             if checkpoint_path:
                 print(f"[INIT] Will save to: {checkpoint_path}")
+            # Enable tqdm progress bars for huggingface_hub downloads
+            os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
         else:
             print(f"[INIT] Loading model from local checkpoint: {checkpoint_path}")
         
         model = build_sam3_image_model(
+            bpe_path=bpe_path,
             checkpoint_path=checkpoint if not load_from_hf else None,
             load_from_HF=load_from_hf,
             device=str(self.device),
