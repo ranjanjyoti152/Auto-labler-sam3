@@ -1,0 +1,41 @@
+# Git
+.git
+.gitignore
+
+# Python
+.venv
+venv
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environment files (use docker-compose env_file instead)
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Data directories (mount as volumes instead)
+datasets/
+Samples/
+weights/
+
+# Documentation
+*.md
+!requirements.txt
+
+# Misc
+.DS_Store
+Thumbs.db
+*.log

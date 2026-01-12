@@ -112,6 +112,65 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ---
 
+## 🐳 Docker Deployment
+
+For easy deployment with GPU support, use Docker:
+
+### Prerequisites
+
+- **Docker** 20.10+ with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+- **NVIDIA GPU** with CUDA 12.6 compatible drivers
+
+### Quick Start with Docker Compose
+
+```bash
+# Clone and configure
+git clone https://github.com/ranjanjyoti152/Auto-labler-sam3.git
+cd Auto-labler-sam3
+cp .env.example .env
+# Edit .env with your HuggingFace token and settings
+
+# Start the service
+docker compose up -d
+
+# Check logs
+docker compose logs -f
+
+# Stop the service
+docker compose down
+```
+
+### Build from Source
+
+```bash
+# Build the Docker image
+docker build -t sam3-auto-labeler .
+
+# Run with GPU support
+docker run -d \
+  --gpus all \
+  -p 8000:8000 \
+  -v ./weights:/app/weights \
+  --env-file .env \
+  --name sam3-auto-labeler \
+  sam3-auto-labeler
+```
+
+### Environment Variables
+
+Create a `.env` file (or copy from `.env.example`) with at minimum:
+
+```env
+SAM3_HF_TOKEN=your_huggingface_token_here
+SAM3_DEVICE=cuda
+```
+
+See [Configuration](#️-configuration) for all available options.
+
+🎉 Access the web interface at http://localhost:8000
+
+---
+
 ## 🎯 YOLO Dataset Preparation Tool
 
 <p align="center">
@@ -458,7 +517,7 @@ Looking for something to work on? Check out our [good first issues](https://gith
 - [x] Label Studio ML backend
 - [x] YOLO dataset generation tool
 - [x] Batch processing with parallel workers
-- [ ] 🐳 Docker image for easy deployment
+- [x] 🐳 Docker image for easy deployment
 - [ ] ☸️ Kubernetes Helm chart
 - [ ] 🖥️ Web UI for dataset management
 - [ ] 🎬 Support for video file input

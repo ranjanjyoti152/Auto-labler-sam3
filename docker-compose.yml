@@ -1,0 +1,53 @@
+# SAM3 Auto-Labeler Docker Compose Configuration
+# Requires NVIDIA Container Toolkit for GPU support
+
+services:
+  sam3-auto-labeler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sam3-auto-labeler
+    
+    # GPU Configuration - requires NVIDIA Container Toolkit
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    ports:
+      - "8000:8000"
+    
+    # Environment configuration
+    env_file:
+      - .env
+    
+    # Persist model weights and datasets
+    volumes:
+      - ./weights:/app/weights
+      - ./datasets:/app/datasets
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    restart: unless-stopped
+
+# Optional: Add Label Studio for human-in-the-loop workflows
+#  label-studio:
+#    image: heartexlabs/label-studio:latest
+#    container_name: label-studio
+#    ports:
+#      - "8080:8080"
+#    volumes:
+#      - ./label-studio-data:/label-studio/data
+#    environment:
+#      - LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
+#      - LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/label-studio/files
+#    restart: unless-stopped
