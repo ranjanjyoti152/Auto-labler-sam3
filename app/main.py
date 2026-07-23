@@ -4,7 +4,10 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any, List, Set
+import asyncio
 import hashlib
+import json
+import logging
 import uuid
 
 import cv2
@@ -18,7 +21,7 @@ from PIL import Image
 
 from app.core.config import Settings, get_settings
 from app.models.sam3_detector import Detection as SamDetection
-from app.models.sam3_detector import Sam3Detector
+from app.models.sam3_detector import Sam3Detector, Sam3DetectorPool
 from app.schemas.detection import (
     BoundingBox,
     DetectRequest,
@@ -33,30 +36,61 @@ from app.services.labelstudio import get_labelstudio_concepts, clear_labels_cach
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "web" / "templates"))
 
+# Per-request detail logs at DEBUG so production runs (thousands of tasks) stay
+# quiet by default and don't dump base64 image payloads to stdout. Raise with
+# LOG_LEVEL=DEBUG when diagnosing. Configured once at import.
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("sam3")
+
 app = FastAPI(title="SAM3 Object Detector", version="0.1.0")
+
+
+# Tracks whether the SAM3 model finished loading. Detection cannot work until
+# this is True, so the readiness probe and /predict gate on it. Kept module-level
+# (not in the lru_cache'd detector) so it is observable even when construction fails.
+_model_ready: bool = False
+_model_load_error: str | None = None
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize detector and create required directories on startup."""
+    global _model_ready, _model_load_error
     print("[STARTUP] Initializing SAM3 Auto Labeler...")
     settings = get_settings()
-    
+
     # Create required directories
     required_dirs = [Path("./weights"), Path("./logs")]
     for d in required_dirs:
         d.mkdir(parents=True, exist_ok=True)
         print(f"[STARTUP] Directory ensured: {d}")
-    
+
     # Pre-load the detector (downloads model if not available)
     print("[STARTUP] Loading SAM3 model (this may take a while on first run)...")
     try:
-        _ = _get_detector()
-        print("[STARTUP] SAM3 model loaded successfully!")
+        pool = _get_detector()
+        _model_ready = True
+        _model_load_error = None
+        # Ensure the threadpool that runs blocking detect() calls is at least as
+        # wide as the GPU pool, so N concurrent requests dispatch to N GPUs
+        # instead of queueing behind a too-small limiter.
+        try:
+            from anyio import to_thread
+
+            limiter = to_thread.current_default_thread_limiter()
+            limiter.total_tokens = max(limiter.total_tokens, pool.size + 4)
+        except Exception as limiter_exc:  # non-fatal: default limiter is 40
+            print(f"[STARTUP] Note: could not resize threadpool: {limiter_exc}")
+        print(f"[STARTUP] SAM3 model loaded successfully on {pool.size} GPU(s): {pool.devices}")
     except Exception as e:
-        print(f"[STARTUP] Warning: Failed to pre-load model: {e}")
-    
-    print("[STARTUP] Server ready to accept requests!")
+        _model_ready = False
+        _model_load_error = f"{type(e).__name__}: {e}"
+        # Loud, unmistakable failure: an auto-labeler that cannot load the model
+        # is useless, and a silent "warning" lets it masquerade as healthy.
+        print(f"[STARTUP] ERROR: Failed to load SAM3 model: {_model_load_error}")
+        print("[STARTUP] Server will report NOT ready until the model loads.")
+
+    print("[STARTUP] Startup complete.")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -74,27 +108,60 @@ async def index(request: Request, settings: Settings = Depends(get_settings)) ->
 
 
 
-def get_detector() -> Sam3Detector:
-    return _get_detector()
+def get_detector() -> Sam3DetectorPool:
+    try:
+        return _get_detector()
+    except Exception as exc:
+        # Surface model-load failures as a clear 503 instead of a bare 500, so
+        # callers (Label Studio, the YOLO tool) can distinguish "server broken"
+        # from "bad request" and back off rather than retry-storming.
+        raise HTTPException(
+            status_code=503,
+            detail=f"SAM3 model is not available: {type(exc).__name__}: {exc}",
+        ) from exc
 
 
 @lru_cache()
-def _get_detector() -> Sam3Detector:
-    return Sam3Detector(get_settings())
+def _get_detector() -> Sam3DetectorPool:
+    # A pool with one model per visible GPU (auto-scales to device_count()).
+    # Exposes the same .detect() signature as a single Sam3Detector, so the rest
+    # of the app is unchanged.
+    return Sam3DetectorPool(get_settings())
 
 
 @app.get("/healthz")
 @app.get("/health")
 @app.get("/predict/health")
 def health_check() -> dict[str, str]:
+    """Liveness: the process is up and serving. Does not imply the model loaded."""
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readiness_check() -> dict[str, Any]:
+    """Readiness: the SAM3 model is loaded and detection can actually run.
+
+    Returns 503 when the model failed to load so orchestrators and the
+    auto-labeling tool can tell a broken deployment from a working one instead
+    of hammering /predict with requests that will all 500.
+    """
+    if not _model_ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not_ready", "error": _model_load_error},
+        )
+    try:
+        pool = _get_detector()
+        return {"status": "ready", "gpus": pool.size, "devices": pool.devices}
+    except Exception:
+        return {"status": "ready"}
 
 
 @app.post("/detect", response_model=DetectResponse)
 async def detect_objects(
     payload: DetectRequest,
     settings: Settings = Depends(get_settings),
-    detector: Sam3Detector = Depends(get_detector),
+    detector: Sam3DetectorPool = Depends(get_detector),
 ) -> DetectResponse:
     concepts = payload.concepts
     if concepts and len(concepts) > settings.max_concepts_per_request:
@@ -153,7 +220,7 @@ def live_stream(
     frame_skip: int = Query(default=1, ge=1, le=600),
     concepts: List[str] | None = Query(default=None),
     settings: Settings = Depends(get_settings),
-    detector: Sam3Detector = Depends(get_detector),
+    detector: Sam3DetectorPool = Depends(get_detector),
 ) -> StreamingResponse:
     if not rtsp_url.startswith("rtsp://"):
         raise HTTPException(status_code=400, detail="Only RTSP urls starting with rtsp:// are supported")
@@ -210,28 +277,38 @@ def live_stream(
 async def label_studio_predict(
     request: Request,
     settings: Settings = Depends(get_settings),
-    detector: Sam3Detector = Depends(get_detector),
+    detector: Sam3DetectorPool = Depends(get_detector),
 ) -> dict[str, Any]:
-    # Log the raw request body
     raw_body = await request.body()
-    print(f"[DEBUG] Raw request body: {raw_body.decode('utf-8', errors='replace')}")
-    
-    import json
+    # Avoid printing the full body at INFO: it can contain multi-MB base64 images.
+    logger.debug("Raw /predict body (%d bytes): %s", len(raw_body), raw_body[:2000])
+
     try:
         body_json = json.loads(raw_body)
     except Exception as e:
-        print(f"[DEBUG] Failed to parse JSON: {e}")
+        logger.warning("Failed to parse /predict JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
     
     # Parse into our schema
     payload = LabelStudioPredictRequest(**body_json)
-    
-    predictions: List[dict[str, Any]] = []
-    for task in payload.tasks:
-        predictions.append(await _predict_for_task(task, settings, detector))
-    
+
+    # Process tasks concurrently so a single batch request spreads across all
+    # GPUs in the pool instead of running strictly one-at-a-time. Each
+    # _predict_for_task offloads the blocking detect() to the threadpool, and
+    # Sam3DetectorPool hands each concurrent call to the next idle GPU. Bound
+    # concurrency to a small multiple of the pool size to keep queued images
+    # (and their decoded frames) from ballooning memory on huge batches.
+    max_parallel = max(1, getattr(detector, "size", 1)) * 2
+    semaphore = asyncio.Semaphore(max_parallel)
+
+    async def _run(task: LabelStudioTask) -> dict[str, Any]:
+        async with semaphore:
+            return await _predict_for_task(task, settings, detector)
+
+    predictions = await asyncio.gather(*(_run(t) for t in payload.tasks))
+
     # Label Studio expects {"results": [...]} format
-    return {"results": predictions}
+    return {"results": list(predictions)}
 
 
 @app.post("/setup")
@@ -260,17 +337,15 @@ async def get_labels(settings: Settings = Depends(get_settings)) -> dict[str, An
 async def _predict_for_task(
     task: LabelStudioTask,
     settings: Settings,
-    detector: Sam3Detector,
+    detector: Sam3DetectorPool,
 ) -> dict[str, Any]:
     data = task.data or {}
-    
-    # Debug logging
-    print(f"[DEBUG] Task ID: {task.id}")
-    print(f"[DEBUG] Task data keys: {list(data.keys())}")
+
+    logger.debug("Task %s data keys: %s", task.id, list(data.keys()))
 
     # Try to get image from various Label Studio field names
     image_url = data.get("image") or data.get("img") or data.get("video") or data.get("rtsp_url")
-    print(f"[DEBUG] Resolved image_url: {str(image_url)[:100] if image_url else None}")
+    logger.debug("Task %s resolved image_url: %s", task.id, str(image_url)[:100] if image_url else None)
     if not image_url:
         # Return empty prediction if no image source found
         return {
@@ -288,7 +363,7 @@ async def _predict_for_task(
         if ls_concepts:
             # Use exact labels only - no expansion to avoid false positives
             concepts = ls_concepts
-            print(f"[DEBUG] Using {len(concepts)} exact labels from Label Studio")
+            logger.debug("Using %d exact labels from Label Studio", len(concepts))
     
     if concepts and len(concepts) > settings.max_concepts_per_request:
         raise HTTPException(
@@ -435,14 +510,30 @@ def _fetch_image_as_cv2(image_url: str, settings: Settings) -> np.ndarray | None
             api_base = settings.labelstudio_api_base.rstrip("/")
             image_url = f"{api_base}{image_url}"
 
-        headers = {}
+        # Send a browser-like User-Agent: many image hosts/CDNs (Wikimedia,
+        # news sites, etc.) return 403 to the default "python-requests" UA,
+        # which silently breaks auto-labeling of web images.
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        }
         # Add auth for Label Studio hosted images
         if settings.labelstudio_api_token and settings.labelstudio_api_base:
             if image_url.startswith(settings.labelstudio_api_base):
                 headers["Authorization"] = f"Token {settings.labelstudio_api_token}"
 
-        resp = requests.get(image_url, headers=headers, timeout=30)
+        resp = requests.get(image_url, headers=headers, timeout=30, stream=True)
         resp.raise_for_status()
+
+        # Guard against non-image responses (HTML error pages, redirects to login,
+        # multi-GB files). Without this a 200 HTML page reaches PIL and raises a
+        # confusing "cannot identify image file" error.
+        content_type = resp.headers.get("Content-Type", "")
+        if content_type and not content_type.lower().startswith(("image/", "application/octet-stream")):
+            print(f"[WARNING] URL returned non-image Content-Type '{content_type}': {image_url[:100]}")
+            return None
 
         # Convert to PIL Image, then to numpy BGR
         pil_image = Image.open(BytesIO(resp.content)).convert("RGB")
@@ -694,7 +785,7 @@ def _format_label_studio_results(
                     break
         
         if not label_match:
-            print(f"[DEBUG] Skipping unrecognized label: {det.label} -> {mapped_label}")
+            logger.debug("Skipping unrecognized label: %s -> %s", det.label, mapped_label)
             continue
             
         bbox = det.bbox

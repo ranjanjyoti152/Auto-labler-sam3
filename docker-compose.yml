@@ -14,7 +14,11 @@ services:
         PYTORCH_CUDA_INDEX: "cu129"
     container_name: sam3-auto-labeler
     
-    # GPU Configuration - requires NVIDIA Container Toolkit
+    # GPU Configuration - requires NVIDIA Container Toolkit.
+    # count: all exposes every host GPU to the container; Sam3DetectorPool then
+    # loads one model per GPU automatically (2 cards -> 2 models, 4 -> 4).
+    # To restrict to specific cards, replace `count: all` with
+    # `device_ids: ["0", "1"]`.
     deploy:
       resources:
         reservations:
@@ -30,22 +34,31 @@ services:
     env_file:
       - .env
     environment:
-      NVIDIA_VISIBLE_DEVICES: ${SAM3_NVIDIA_VISIBLE_DEVICES:-0}
-      CUDA_VISIBLE_DEVICES: ${SAM3_CUDA_VISIBLE_DEVICES:-0}
+      # Default to ALL GPUs: Sam3DetectorPool loads one model per visible card
+      # and routes by load. To dedicate specific cards (e.g. leave GPU 1 for the
+      # cosmos service below), set SAM3_NVIDIA_VISIBLE_DEVICES=0 (and optionally
+      # SAM3_CUDA_VISIBLE_DEVICES=0) in your .env.
+      NVIDIA_VISIBLE_DEVICES: ${SAM3_NVIDIA_VISIBLE_DEVICES:-all}
+      CUDA_VISIBLE_DEVICES: ${SAM3_CUDA_VISIBLE_DEVICES:-all}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     
-    # Persist model weights and datasets
+    # Persist model weights and datasets.
+    # The HF cache mount is what actually persists the downloaded SAM3 checkpoint
+    # (~2GB). Without it every container recreate re-downloads from HuggingFace,
+    # since the model loads into ~/.cache/huggingface, not /app/weights.
     volumes:
       - ./weights:/app/weights
       - ./datasets:/app/datasets
+      - hf_cache:/root/.cache/huggingface
     
-    # Health check
+    # Health check probes /readyz, which stays 503 until the SAM3 model loads.
+    # start_period is generous because the first run downloads a ~2GB checkpoint.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 600s
     
     restart: unless-stopped
 
@@ -54,6 +67,10 @@ services:
   # This service builds NVIDIA Cosmos Predict2.5 from a sibling checkout:
   #   git clone https://github.com/nvidia-cosmos/cosmos-predict2.5.git ../cosmos-predict2.5
   #
+  # By default it pins to GPU 1 (COSMOS_*_VISIBLE_DEVICES=1). The SAM3 labeler
+  # above uses ALL GPUs, so if you run both at once they share GPU 1 — set
+  # COSMOS_CUDA_VISIBLE_DEVICES / SAM3_NVIDIA_VISIBLE_DEVICES to carve them
+  # apart when you need dedicated cards.
   cosmos:
     depends_on:
       sam3-auto-labeler:
@@ -89,6 +106,9 @@ services:
       - .:/auto-labeler
     working_dir: /workspace
     command: ["sleep", "infinity"]
+
+volumes:
+  hf_cache:
 
 # Optional: Add Label Studio for human-in-the-loop workflows
 #  label-studio:

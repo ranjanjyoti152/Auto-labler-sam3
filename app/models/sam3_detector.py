@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ContextManager, Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence
+import contextlib
 import importlib.util
 import os
+import queue
 import shutil
 import sys
+import threading
 
 import cv2
 import numpy as np
@@ -259,6 +261,23 @@ CUSTOM_CONCEPTS: List[str] = [
 
 DEFAULT_CONCEPTS: List[str] = COCO_CONCEPTS + SAFETY_CONCEPTS + CUSTOM_CONCEPTS
 
+# Substrings identifying safety-critical labels that must bypass the
+# min_box_area filter. These objects (PPE, weapons, fire/smoke) are frequently
+# small in frame - a hard hat seen from above can be ~150 px^2 - and missing
+# one is far more costly than a small false positive. Matched case-insensitively
+# against the detection label as a substring, so "hard hat", "safety helmet",
+# "reflective vest" etc. are all covered.
+SAFETY_CRITICAL_KEYWORDS: tuple[str, ...] = (
+    "helmet", "hard hat", "hat", "vest", "goggles", "glove", "mask",
+    "shield", "harness", "respirator", "fire", "flame", "smoke", "spark",
+    "gun", "weapon", "knife", "rifle", "pistol",
+)
+
+
+def _is_safety_critical(label: str) -> bool:
+    low = label.lower()
+    return any(kw in low for kw in SAFETY_CRITICAL_KEYWORDS)
+
 
 @dataclass(slots=True)
 class Detection:
@@ -272,16 +291,24 @@ class Detection:
 class Sam3Detector:
     """Text-prompted SAM3 detector that returns per-concept bounding boxes."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, device: str | torch.device | None = None) -> None:
         # Ensure required directories exist
         _ensure_directories()
-        
+
         self.settings = settings
-        preferred = settings.device.lower()
-        if preferred == "cuda" and not torch.cuda.is_available():
-            self.device = torch.device("cpu")
+        # An explicit device (e.g. "cuda:1") overrides settings.device. This is
+        # how Sam3DetectorPool pins one model per GPU; without it we honour the
+        # configured device and fall back to CPU when CUDA is unavailable.
+        if device is not None:
+            self.device = torch.device(device)
+            if self.device.type == "cuda" and not torch.cuda.is_available():
+                self.device = torch.device("cpu")
         else:
-            self.device = torch.device(preferred)
+            preferred = settings.device.lower()
+            if preferred == "cuda" and not torch.cuda.is_available():
+                self.device = torch.device("cpu")
+            else:
+                self.device = torch.device(preferred)
 
         self._processor: Sam3Processor | None = None
         self._default_concepts = self._build_default_concepts()
@@ -327,18 +354,33 @@ class Sam3Detector:
         else:
             print(f"[INIT] Loading model from local checkpoint: {checkpoint_path}")
         
-        model = build_sam3_image_model(
-            bpe_path=bpe_path,
-            checkpoint_path=checkpoint if not load_from_hf else None,
-            load_from_HF=load_from_hf,
-            device=str(self.device),
-            eval_mode=True,
-            enable_segmentation=True,
-            enable_inst_interactivity=False,
-        )
-        
+        # build_sam3_image_model only moves the model to GPU when device == the
+        # literal string "cuda" (it does `if device == "cuda": model.cuda()`),
+        # so "cuda:1" would leave the model on CPU. To target a specific card we
+        # pass "cuda" but run the build inside torch.cuda.device(index), so the
+        # builder's .cuda() resolves to cuda:<index>. CPU keeps its own string.
+        if self.device.type == "cuda":
+            builder_device = "cuda"
+            build_ctx = torch.cuda.device(self.device.index or 0)
+        else:
+            builder_device = str(self.device)
+            build_ctx = contextlib.nullcontext()
+
+        with build_ctx:
+            model = build_sam3_image_model(
+                bpe_path=bpe_path,
+                checkpoint_path=checkpoint if not load_from_hf else None,
+                load_from_HF=load_from_hf,
+                device=builder_device,
+                eval_mode=True,
+                enable_segmentation=True,
+                enable_inst_interactivity=False,
+            )
+
         print(f"[INIT] SAM3 model loaded successfully on {self.device}")
-        
+
+        # The processor gets the concrete device (cuda:N) - it uses it only to
+        # place small helper tensors, which honours the index correctly.
         self._processor = Sam3Processor(
             model=model,
             device=str(self.device),
@@ -390,12 +432,6 @@ class Sam3Detector:
             raise ValueError("At least one concept prompt must be configured before running detection.")
         return prompts
 
-    def _inference_autocast(self) -> ContextManager[None]:
-        """SAM3's fused ViT path emits bf16 activations; autocast keeps later layers compatible."""
-        if self.device.type in {"cuda", "cpu"}:
-            return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
-        return nullcontext()
-
     def detect(
         self,
         frame: np.ndarray,
@@ -409,9 +445,25 @@ class Sam3Detector:
         
         # Convert frame once
         pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
+
+        # SAM3's fused/flash-attention kernels emit BFloat16 activations, which
+        # then hit FP32 linear weights and raise
+        # "mat1 and mat2 must have the same dtype, but got BFloat16 and Float".
+        # Running the forward pass under CUDA autocast(bfloat16) reconciles the
+        # dtypes. On CPU we skip autocast (bf16 matmul is unsupported / slow).
+        if self.device.type == "cuda":
+            # Pin BOTH the autocast and the active CUDA device to THIS detector's
+            # card. When several detectors run concurrently (one per GPU via
+            # Sam3DetectorPool), any op that relies on the ambient current device
+            # must land on cuda:N, not default to cuda:0.
+            device_ctx = torch.cuda.device(self.device.index or 0)
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        else:
+            device_ctx = contextlib.nullcontext()
+            autocast_ctx = contextlib.nullcontext()
+
         # Set image once - this is the expensive operation
-        with torch.inference_mode(), self._inference_autocast():
+        with torch.inference_mode(), device_ctx, autocast_ctx:
             state = self._processor.set_image(pil_frame)
 
             detections: List[Detection] = []
@@ -451,10 +503,18 @@ class Sam3Detector:
                 )
                 self._processor.reset_all_prompts(state)
 
-        # Filter tiny boxes (likely false positives)
+        # Filter tiny boxes (likely false positives). Safety-critical objects
+        # (PPE, weapons, fire/smoke) are exempt from the normal threshold because
+        # they are often small in frame and must not be silently dropped; they
+        # only have to clear a much smaller floor to reject pure noise.
         min_box_area = getattr(self.settings, 'min_box_area', 500)
+        safety_min_area = min(min_box_area, 64)
         if min_box_area > 0:
-            detections = [d for d in detections if d.bbox["width"] * d.bbox["height"] >= min_box_area]
+            detections = [
+                d for d in detections
+                if d.bbox["width"] * d.bbox["height"]
+                >= (safety_min_area if _is_safety_critical(d.label) else min_box_area)
+            ]
 
         # Apply NMS to remove duplicate detections
         nms_threshold = getattr(self.settings, 'nms_threshold', 0.3)
@@ -474,22 +534,34 @@ class Sam3Detector:
         return detections
 
     def _apply_cross_class_nms(self, detections: List[Detection], iou_threshold: float = 0.3) -> List[Detection]:
-        """Apply NMS across ALL classes - removes overlapping boxes even with different labels.
-        
-        This handles cases where the same object is detected with different prompts
-        (e.g., 'car' and 'truck' on the same vehicle). Keep the higher scoring one.
+        """Apply NMS across ALL classes - removes duplicate boxes of different labels.
+
+        This handles cases where the SAME object is detected under different prompts
+        (e.g., 'car' and 'truck' on one vehicle). Keep the higher scoring one.
+
+        CRITICAL: it must NOT suppress a smaller box that is *nested inside* a
+        larger box of a different class - that is a genuine part-of relationship,
+        not a duplicate. A helmet/hard hat sits inside a person, a license plate
+        inside a car, a tie inside a person. Plain IoU is low for such nested
+        pairs, but at low thresholds (0.3) a helmet can still be deleted. For a
+        safety/PPE labeler, silently dropping helmets/vests inside people is the
+        worst possible failure, so we explicitly protect contained sub-objects.
         """
         if len(detections) <= 1:
             return detections
-        
+
         # Sort by score descending - highest score wins
         detections = sorted(detections, key=lambda d: d.score, reverse=True)
-        
+
         keep: List[Detection] = []
         for det in detections:
             # Check if this detection overlaps too much with any already-kept detection
             dominated = False
             for kept in keep:
+                # A nested sub-object (small box mostly inside a larger, different-class
+                # box) is a distinct part, not a duplicate - never suppress it.
+                if det.label.lower() != kept.label.lower() and self._is_contained(det.bbox, kept.bbox):
+                    continue
                 iou = self._compute_iou(det.bbox, kept.bbox)
                 if iou > iou_threshold:
                     # This box overlaps with a higher-scoring box, skip it
@@ -497,8 +569,37 @@ class Sam3Detector:
                     break
             if not dominated:
                 keep.append(det)
-        
+
         return keep
+
+    def _is_contained(self, inner: Dict[str, int], outer: Dict[str, int], containment: float = 0.7) -> bool:
+        """True if `inner` is a smaller box mostly contained within `outer`.
+
+        Used to recognise part-of relationships (helmet in person, plate in car)
+        so cross-class NMS does not treat the part as a duplicate of the whole.
+        """
+        inner_area = max(1, inner["width"] * inner["height"])
+        outer_area = max(1, outer["width"] * outer["height"])
+        # A genuine part must be SUBSTANTIALLY smaller than its container (a helmet
+        # is a small fraction of a person). Two boxes of similar size that overlap
+        # heavily are the same object detected under two prompts (car/truck) - that
+        # is a real duplicate and must still be suppressed, so bail out here.
+        if inner_area > 0.5 * outer_area:
+            return False
+
+        ix0, iy0 = inner["x"], inner["y"]
+        ix1, iy1 = ix0 + inner["width"], iy0 + inner["height"]
+        ox0, oy0 = outer["x"], outer["y"]
+        ox1, oy1 = ox0 + outer["width"], oy0 + outer["height"]
+
+        # Intersection of inner with outer.
+        xi0, yi0 = max(ix0, ox0), max(iy0, oy0)
+        xi1, yi1 = min(ix1, ox1), min(iy1, oy1)
+        if xi1 <= xi0 or yi1 <= yi0:
+            return False
+        inter = (xi1 - xi0) * (yi1 - yi0)
+        # Fraction of the inner box that lies inside the outer box.
+        return (inter / inner_area) >= containment
 
     def _apply_nms_per_class(self, detections: List[Detection], iou_threshold: float = 0.7) -> List[Detection]:
         """Apply NMS per class - only suppress overlapping boxes of the SAME label."""
@@ -638,3 +739,62 @@ class Sam3Detector:
                 )
             )
         return serialized
+
+
+class Sam3DetectorPool:
+    """Load one Sam3Detector per available GPU and dispatch by load.
+
+    Scales automatically to however many GPUs the process can see
+    (``torch.cuda.device_count()``): 1 card -> 1 model, 4 cards -> 4 models,
+    no code change. Each detector is pinned to its own ``cuda:N`` and holds a
+    full copy of the model (SAM3 is ~6 GB, trivial next to a 32 GB card).
+
+    A blocking queue acts as the scheduler: ``detect()`` checks out an idle
+    detector, runs inference, and returns it. With N models and callers driving
+    ``detect()`` from N+ threads (FastAPI's threadpool), up to N images are
+    labelled truly in parallel. When every model is busy, extra callers block
+    until one frees up - i.e. work is spread across GPUs "as per load".
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._detectors: List[Sam3Detector] = []
+
+        if settings.device.lower() == "cuda" and torch.cuda.is_available():
+            n = torch.cuda.device_count()
+            devices = [f"cuda:{i}" for i in range(n)]
+        else:
+            devices = [settings.device]
+
+        print(f"[POOL] Initializing {len(devices)} detector(s) on devices: {devices}")
+        for dev in devices:
+            print(f"[POOL] Loading SAM3 model on {dev} ...")
+            self._detectors.append(Sam3Detector(settings, device=dev))
+        print(f"[POOL] Ready: {len(self._detectors)} detector(s).")
+
+        # Idle detectors available for checkout. maxsize == pool size.
+        self._available: "queue.Queue[Sam3Detector]" = queue.Queue()
+        for det in self._detectors:
+            self._available.put(det)
+        self._lock = threading.Lock()
+
+    @property
+    def size(self) -> int:
+        return len(self._detectors)
+
+    @property
+    def devices(self) -> List[str]:
+        return [str(d.device) for d in self._detectors]
+
+    def detect(
+        self,
+        frame: np.ndarray,
+        frame_index: int,
+        concepts: Sequence[str] | None = None,
+    ) -> List[Detection]:
+        """Run detection on the next idle GPU, blocking if all are busy."""
+        detector = self._available.get()  # blocks until a detector is free
+        try:
+            return detector.detect(frame, frame_index, concepts)
+        finally:
+            self._available.put(detector)

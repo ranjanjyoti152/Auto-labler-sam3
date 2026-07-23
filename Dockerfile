@@ -32,7 +32,11 @@ WORKDIR /app
 # Copy requirements first for better layer caching
 COPY requirements.txt .
 
-# Install PyTorch with CUDA support and other dependencies
+# Install PyTorch with CUDA support and other dependencies.
+# The default cu129/torch 2.8 wheels ship kernels for Blackwell (sm_120, e.g.
+# RTX 50-series / 5090). Anything built only up to sm_90 (e.g. cu126) fails at
+# model load with "CUDA error: no kernel image is available for execution on
+# the device". Override via build args if you need a different CUDA/torch combo.
 ARG PYTORCH_VERSION=2.8.0
 ARG TORCHVISION_VERSION=0.23.0
 ARG TORCHAUDIO_VERSION=2.8.0
@@ -54,8 +58,11 @@ RUN mkdir -p /app/weights
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')" || exit 1
+# Probe /readyz (not /healthz): it 503s until the SAM3 model is actually loaded,
+# so a container that cannot run the model is correctly reported unhealthy.
+# start-period is generous because first run downloads a ~2GB checkpoint.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')" || exit 1
 
 # Run the FastAPI application
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
