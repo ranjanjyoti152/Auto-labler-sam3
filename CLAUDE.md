@@ -41,6 +41,17 @@ There is **no test suite, linter, or build step** configured despite what the RE
 
 All server settings come from environment variables with the `SAM3_` prefix, loaded via `pydantic-settings` from `.env` (see `app/core/config.py` for the full list and defaults). `get_settings()` is `@lru_cache()`-ed — call `get_settings.cache_clear()` if you need to reload settings in tests. Note the config defaults differ from README examples — e.g. `score_threshold` defaults to `0.5`, `max_detections` to `25`. The YOLO tool reads a broader set of env vars including `SAM3_LABELSTUDIO_API_BASE`, `SAM3_LABELSTUDIO_API_TOKEN`, `SAM3_SERVER_URL`, and `YOLO_BATCH_SIZE`/`YOLO_WORKERS`.
 
+**The deployed `.env` diverges from the code defaults in four ways that change behaviour.** Read `.env` before reasoning about runtime behaviour; don't infer it from `config.py`:
+
+| Setting | Code default | This `.env` | Consequence |
+|---|---|---|---|
+| `score_threshold` | `0.5` | `0.35` | recall-favouring, see safety section below |
+| `max_detections` | `25` | `250` | dense traffic scenes keep all boxes |
+| `max_image_size` | `1024` | `0` | resize disabled — full-res inference, slower, no box rescaling |
+| `use_default_concepts` | `true` | `false` | **`DEFAULT_CONCEPTS` is not loaded at all** |
+
+That last one is the surprising one: with `use_default_concepts=false` and no `concepts_path`, `_default_concepts` is an empty list, so `detect()` raises `ValueError("At least one concept prompt must be configured…")` for any request that doesn't supply concepts. In practice every concept comes per-request — from the task payload, or fetched from the Label Studio project config. `/detect` with no `concepts` will fail under this `.env`; that's configuration, not a bug.
+
 Copy `.env.example` to `.env`. Minimum required:
 
 ```env
@@ -71,10 +82,18 @@ Key routes:
 **Label Studio integration (two directions):**
 - `POST /predict` (also `/label-studio/predict`) is the ML-backend endpoint. `_predict_for_task` resolves the image from many possible field names, resizes large images (scaling boxes back afterward), runs detection, and formats results as `rectanglelabels` percentages.
 - Concept/label resolution: if a task carries no `concepts`, labels are fetched from the Label Studio project config via `app/services/labelstudio.py` (XML-parsed, cached 1h; cleared on every `/setup` call). `_format_label_studio_results` in `main.py` maps SAM3's free-form prompt outputs back onto the project's exact label set using a large hardcoded synonym `label_mapping` (e.g. "flames"→"fire", "sedan"→"car"), and **drops any detection whose label isn't in the valid set**. When adding/renaming concepts, update both `DEFAULT_CONCEPTS` and this mapping or detections will be silently discarded.
+- `label_mapping` is lossy in both directions, and two entries deserve care. `"bench": "chair"` and `"van": "bus"` collapse labels that are *distinct COCO concepts* — a project whose label set contains both `bench` and `chair` can never receive a `bench` prediction, because every bench detection is rewritten to `chair` before the valid-set check. Before adding a synonym, confirm the source term isn't itself a label some project wants.
+- `fetch_project_labels` with no `project_id` (the only way `get_labelstudio_concepts` calls it) unions labels across **every** project on the server. On a multi-project Label Studio instance that means every task is prompted with the full cross-project label union, then filtered against the same union — so a prediction from another project's vocabulary can pass the valid-set check. This is also what makes `max_concepts_per_request=160` reachable in practice.
 
 ### Tools
 
 **`tools/prepare_yolo_dataset.py`** — standalone CLI (not imported by the app) that talks to Label Studio and the SAM3 `/predict` endpoint. Streams tasks in batches, downloads images in parallel (`ThreadPoolExecutor`), either uses existing annotations (`--use-existing`) or auto-labels (`--auto-label`), converts `RectangleLabels` annotations to YOLO format, splits into train/val/test, and writes `dataset.yaml`. With `--balance-classes --cosmos-augment` it also invokes LM Studio for prompt generation and triggers Cosmos jobs.
+
+It shares no code with `app/` — it re-reads `.env` itself (`_load_env_file`, with its own `_strip_inline_comment` since the `.env.example` values carry trailing `# comments`) and re-declares its own defaults. **Changing a setting in `app/core/config.py` does not affect the tool**, and vice versa; both files need editing.
+
+`SAM3Client` (line ~598) sends `score_threshold`, `nms_threshold`, `min_box_area`, `max_detections`, and `cross_class_nms` inside each task's `data` dict. **The server ignores all of them.** `_predict_for_task` only reads `image`/`img`/`video`/`rtsp_url`, `concepts`, and `frame_skip` from `data`; thresholds always come from the server's own `Settings`. So tuning detection via the tool's env vars is a no-op — change the server's `.env` and restart it instead. Either wire these through in `_predict_for_task` or treat them as dead payload, but don't assume they work.
+
+`SAM3Client.health_check()` probes `/health` (liveness), which returns 200 even when the model failed to load. A run that passes the health check and then gets 503s from every `/predict` is this gap; `/readyz` is the correct probe.
 
 **`tools/cosmos_predict25_batch.py`** — creates and optionally runs NVIDIA Cosmos Predict2.5 generation jobs. Cosmos runs as a separate Docker service (`cosmos` in `docker-compose.yml`) built from a sibling repo checkout at `../cosmos-predict2.5`. Synthetic images are always placed in `train/` only, never `val/` or `test/`.
 
@@ -118,6 +137,9 @@ Two placement gotchas that WILL silently break multi-GPU if refactored:
 - `sam3` must be installed from source: `sam3 @ git+https://github.com/facebookresearch/sam3.git` (see `requirements.txt`)
 - PyTorch must be installed separately before `pip install -r requirements.txt` because it requires a CUDA-specific index URL
 - The `third_party/sam3_patch/` directory vendors the missing `sam3.sam` subpackage — do not remove it
+- `sam3_detector.py` imports `tqdm`, which is **not in `requirements.txt`** — it currently resolves as a transitive dep of `sam3`/`huggingface_hub`. The import is also unused (only a comment mentions it). Either drop the import or pin `tqdm` explicitly rather than relying on the transitive pull.
+
+Two functions are dead code — no call sites anywhere: `Sam3Detector._apply_nms` (superseded by `_apply_nms_per_class` + `_apply_cross_class_nms`) and `main._expand_concepts` (synonym expansion, deliberately abandoned — `_predict_for_task` uses Label Studio's exact labels to avoid false positives). Don't wire `_expand_concepts` back in expecting an improvement; expansion is what `label_mapping` undoes on the way out.
 
 ## Conventions
 

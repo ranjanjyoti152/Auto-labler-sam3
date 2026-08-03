@@ -29,12 +29,14 @@ Examples:
 """
 
 import argparse
+import copy
 import json
 import math
 import os
 import sys
 import shutil
 import random
+import tempfile
 import time
 import base64
 import io
@@ -1095,14 +1097,26 @@ def process_batch(
         with open(label_path, "w") as f:
             f.write("\n".join(yolo_lines))
         
-        # Save preview image with bounding boxes
+        # Save preview image with bounding boxes.
+        # ~/labeled_previews is a fixed shared path, so a second run of this tool
+        # (or a manual cleanup) can delete it mid-run. A missing preview dir must
+        # not throw away an image+label pair that was already written, so recreate
+        # it and treat a preview failure as non-fatal.
         if preview_dir is not None:
             preview_data = draw_preview_image(image_data, annotations, label_to_id)
             if preview_data:
                 preview_path = preview_dir / f"{stem}_preview.jpg"
-                with open(preview_path, "wb") as f:
-                    f.write(preview_data)
-        
+                try:
+                    with open(preview_path, "wb") as f:
+                        f.write(preview_data)
+                except FileNotFoundError:
+                    try:
+                        preview_dir.mkdir(parents=True, exist_ok=True)
+                        with open(preview_path, "wb") as f:
+                            f.write(preview_data)
+                    except Exception:
+                        pass
+
         # Update stats
         stats.add_bytes(len(image_data))
         labels_in_task = [ann["label"] for ann in annotations if ann["label"] in label_to_id]
@@ -1269,27 +1283,48 @@ def split_dataset(
         (output_dir / split / "images").mkdir(parents=True, exist_ok=True)
         (output_dir / split / "labels").mkdir(parents=True, exist_ok=True)
     
-    def copy_files(files: List[Path], split: str):
+    # This is the last step of a run that may have taken days. A failure here
+    # (disk full, permissions) must not abort the whole split and leave nothing
+    # usable, so each pair is copied independently and failures are counted.
+    # An image whose label fails to copy is rolled back, because an image with no
+    # label file silently becomes a background/negative sample during training.
+    copy_failures: Dict[str, int] = {}
+
+    def copy_files(files: List[Path], split: str) -> int:
+        copied = 0
         for img_file in files:
-            # Copy image
             dst_img = output_dir / split / "images" / img_file.name
-            shutil.copy2(img_file, dst_img)
-            
-            # Copy label
             label_file = labels_dir / f"{img_file.stem}.txt"
+            dst_label = output_dir / split / "labels" / label_file.name
+            try:
+                shutil.copy2(img_file, dst_img)
+            except Exception as e:
+                copy_failures[type(e).__name__] = copy_failures.get(type(e).__name__, 0) + 1
+                continue
             if label_file.exists():
-                dst_label = output_dir / split / "labels" / label_file.name
-                shutil.copy2(label_file, dst_label)
-    
-    copy_files(train_files, "train")
-    copy_files(val_files, "val")
-    copy_files(test_files, "test")
-    
-    return {
-        "train": len(train_files),
-        "val": len(val_files),
-        "test": len(test_files),
+                try:
+                    shutil.copy2(label_file, dst_label)
+                except Exception as e:
+                    copy_failures[type(e).__name__] = copy_failures.get(type(e).__name__, 0) + 1
+                    dst_img.unlink(missing_ok=True)
+                    continue
+            copied += 1
+        return copied
+
+    actual = {
+        "train": copy_files(train_files, "train"),
+        "val": copy_files(val_files, "val"),
+        "test": copy_files(test_files, "test"),
     }
+
+    if copy_failures:
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(copy_failures.items()))
+        print(f"{Colors.YELLOW}⚠ {sum(copy_failures.values())} file(s) could not be copied ({detail}){Colors.ENDC}")
+        print(f"  Kept {sum(actual.values())} complete image+label pair(s).")
+    
+    # Report what actually landed on disk, not what was planned - otherwise the
+    # final summary overstates the dataset size when copies failed.
+    return actual
 
 
 def create_dataset_yaml(output_dir: Path, labels: List[str], project_name: str):
@@ -1548,6 +1583,410 @@ def write_json_file(path: Path, data: Any) -> None:
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
+
+
+DEFAULT_COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://localhost:8188")
+DEFAULT_COMFYUI_WORKFLOW = os.environ.get(
+    "COMFYUI_WORKFLOW",
+    str(Path(__file__).resolve().parent.parent / "comfyui" / "workflows" / "krea2_turbo.json"),
+)
+
+
+def comfyui_prompts(project_title: str, weak_classes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build one image-generation prompt per weak class.
+
+    Unlike the Cosmos path this targets a still-image workflow, so `count` is a
+    number of images rather than videos. The prompt is written for a fixed
+    surveillance camera because that is the domain the real Label Studio frames
+    come from - a synthetic image shot from a different viewpoint teaches YOLO
+    the wrong prior.
+    """
+    prompts: List[Dict[str, Any]] = []
+    for index, weak in enumerate(weak_classes):
+        class_name = weak["class_name"]
+        readable = class_name.replace("_", " ")
+        prompts.append({
+            "class_name": class_name,
+            "name": f"{slugify_name(class_name)}_balanced",
+            # Describe the SCENE, not the camera. Naming the camera as a subject
+            # makes the prompt refiner render the camera itself - a fisheye lens
+            # housing and a black vignette border - which is useless as training
+            # data. "elevated view" gets the surveillance angle without that.
+            "prompt": (
+                f"photograph of a busy street scene, elevated view looking down at the road, "
+                f"one or more clearly visible {readable} on the street, other traffic and pedestrians around, "
+                f"real world background clutter, natural daylight, sharp focus, documentary photo, "
+                f"{project_title} context"
+            ),
+            "count": int(weak["target_synthetic_frames"]),
+            "seed": 1000 + index * 100,
+        })
+    return prompts
+
+
+SCENE_VARIATIONS: List[str] = [
+    "on a narrow market street with shops on both sides",
+    "at a busy four-way intersection",
+    "on a wide highway with fast moving traffic",
+    "on a wet road just after rain with reflections",
+    "in early morning golden light with long shadows",
+    "at dusk under street lights",
+    "on a dusty semi-rural road at the edge of town",
+    "in heavy congested bumper to bumper traffic",
+    "on a residential lane with parked vehicles",
+    "under an overpass in partial shade",
+    "on a bridge with open sky behind",
+    "at a crowded bus stop area",
+]
+
+CAMERA_VARIATIONS: List[str] = [
+    "elevated view looking down at the road",
+    "high mounted wide angle view of the street",
+    "second floor window view of the street below",
+    "slightly angled overhead view across the road",
+]
+
+
+def lmstudio_scene_prompts(
+    client: "LMStudioPromptClient",
+    project_title: str,
+    class_name: str,
+    count: int,
+) -> List[str]:
+    """Ask LM Studio for `count` visually distinct prompts for one class.
+
+    Returns [] on any failure so the caller can fall back to the deterministic
+    variation table - prompt generation must never be able to kill a long run.
+    """
+    readable = class_name.replace("_", " ")
+    system_prompt = (
+        "You write prompts for a text-to-image model that generates TRAINING DATA for a YOLO "
+        "object detector. Return only valid JSON, no markdown. Each prompt must describe a "
+        "realistic photograph of a street/traffic scene where the target object is clearly "
+        "visible and large enough to annotate. Describe the SCENE, never the camera hardware - "
+        "do not mention CCTV, surveillance cameras, fisheye, or lens housings, because the "
+        "image model will draw the camera itself. Vary location, time of day, weather, traffic "
+        "density, and viewpoint across the prompts. No text overlays, watermarks, or logos."
+    )
+    user_payload = {
+        "project_title": project_title,
+        "target_class": class_name,
+        "how_many_prompts": count,
+        "required_output_schema": {"prompts": ["single detailed prompt string", "..."]},
+        "rules": [
+            f"Every prompt must contain at least one clearly visible {readable}.",
+            "Each prompt must be visually DIFFERENT from the others.",
+            "Photographic and realistic, not illustration or 3D render.",
+            f"Return exactly {count} prompts.",
+        ],
+    }
+    # Some OpenAI-compatible servers (llama.cpp / LM Studio builds) reject
+    # {"type": "json_object"} and require a json_schema. Try the schema form
+    # first, then fall back to json_object, then to no constraint at all, so
+    # this works across server flavours.
+    base_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(user_payload, indent=2)},
+    ]
+    schema = {
+        "type": "object",
+        "properties": {"prompts": {"type": "array", "items": {"type": "string"}}},
+        "required": ["prompts"],
+    }
+    formats: List[Optional[Dict[str, Any]]] = [
+        {"type": "json_schema", "json_schema": {"name": "scene_prompts", "schema": schema}},
+        {"type": "json_object"},
+        None,
+    ]
+    headers = {"Content-Type": "application/json"}
+    if client.api_key:
+        headers["Authorization"] = f"Bearer {client.api_key}"
+
+    resp = None
+    for response_format in formats:
+        payload: Dict[str, Any] = {
+            "model": client.model,
+            "messages": base_messages,
+            "temperature": 0.9,
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        try:
+            candidate = requests.post(
+                f"{client.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=client.timeout,
+            )
+        except Exception:
+            return []
+        if candidate.status_code == 400:
+            # Unsupported response_format for this server; try the next shape.
+            continue
+        resp = candidate
+        break
+    if resp is None:
+        return []
+
+    try:
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        data = parse_lmstudio_json(content)
+        prompts = data.get("prompts") if isinstance(data, dict) else data
+        if not isinstance(prompts, list):
+            return []
+        cleaned = [str(p).strip() for p in prompts if isinstance(p, (str, int, float)) and str(p).strip()]
+        # Only keep prompts that actually mention the target, otherwise SAM3
+        # will reject the image and the generation time is wasted.
+        keep = [p for p in cleaned if readable.lower() in p.lower() or class_name.lower() in p.lower()]
+        return keep or cleaned
+    except Exception:
+        return []
+
+
+def varied_scene_prompts(project_title: str, class_name: str, count: int, seed_offset: int = 0) -> List[str]:
+    """Deterministic per-image prompt variety without needing any LLM.
+
+    Walks the scene/camera tables so consecutive images for one class differ in
+    location, lighting and viewpoint instead of being the same prompt at a new
+    seed.
+    """
+    readable = class_name.replace("_", " ")
+    prompts: List[str] = []
+    n_scene, n_cam = len(SCENE_VARIATIONS), len(CAMERA_VARIATIONS)
+    for i in range(count):
+        idx = i + seed_offset
+        scene = SCENE_VARIATIONS[idx % n_scene]
+        # Advance the camera on a different cycle than the scene, so the two
+        # tables combine into n_scene * n_cam distinct pairings instead of
+        # repeating every n_scene images.
+        camera = CAMERA_VARIATIONS[(idx // n_scene + idx) % n_cam]
+        prompts.append(
+            f"photograph of a street scene, {camera}, "
+            f"one or more clearly visible {readable} {scene}, "
+            f"other traffic and pedestrians around, real world background clutter, "
+            f"sharp focus, documentary photo, {project_title} context"
+        )
+    return prompts
+
+
+class ComfyUIClient:
+    """Drive a ComfyUI API-format workflow over HTTP to generate images.
+
+    The workflow JSON is API format (node-id keyed), so prompt text and seed are
+    injected by node id. Node ids are auto-detected rather than hardcoded, so a
+    re-exported workflow keeps working as long as it still has a multiline
+    string node feeding the sampler and a KSampler-like node with a seed.
+    """
+
+    def __init__(self, base_url: str, workflow_path: Path, timeout: int = 600):
+        self.base_url = base_url.rstrip("/")
+        self.workflow_path = Path(workflow_path)
+        self.timeout = timeout
+        if not self.workflow_path.exists():
+            raise FileNotFoundError(f"ComfyUI workflow not found: {self.workflow_path}")
+        with open(self.workflow_path, "r") as f:
+            self.workflow = json.load(f)
+        if not isinstance(self.workflow, dict) or not self.workflow:
+            raise ValueError(
+                f"{self.workflow_path} is not an API-format ComfyUI workflow. "
+                "Export it with Workflow -> Export (API)."
+            )
+        if "nodes" in self.workflow:
+            raise ValueError(
+                f"{self.workflow_path} looks like a UI workflow, not API format. "
+                "Re-export with Workflow -> Export (API)."
+            )
+        self.prompt_node = self._find_prompt_node()
+        self.seed_nodes = self._find_seed_nodes()
+        self.save_nodes = [
+            nid for nid, node in self.workflow.items()
+            if node.get("class_type") in ("SaveImage", "SaveImageWebsocket")
+        ]
+        if not self.save_nodes:
+            raise ValueError(f"{self.workflow_path} has no SaveImage node; nothing would be written.")
+
+    def _find_prompt_node(self) -> str:
+        """Locate the user-prompt node.
+
+        Prefers the placeholder we ship, then the multiline string node that is
+        NOT a system prompt (system prompts are long instruction blocks).
+        """
+        candidates = []
+        for nid, node in self.workflow.items():
+            if node.get("class_type") not in ("PrimitiveStringMultiline", "PrimitiveString", "String"):
+                continue
+            value = str(node.get("inputs", {}).get("value", ""))
+            if value.strip() == "PROMPT_PLACEHOLDER":
+                return nid
+            candidates.append((nid, value))
+        # Shortest value wins: the system prompt is a long instruction block.
+        text_candidates = [c for c in candidates if "expert prompt engineer" not in c[1].lower()]
+        pool = text_candidates or candidates
+        if not pool:
+            raise ValueError(
+                f"{self.workflow_path} has no multiline string node to inject the prompt into."
+            )
+        return min(pool, key=lambda c: len(c[1]))[0]
+
+    def _find_seed_nodes(self) -> List[str]:
+        return [
+            nid for nid, node in self.workflow.items()
+            if "seed" in node.get("inputs", {}) and isinstance(node["inputs"].get("seed"), (int, float))
+        ]
+
+    def health_check(self) -> bool:
+        try:
+            resp = requests.get(f"{self.base_url}/system_stats", timeout=10)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def generate(self, prompt: str, seed: int, filename_prefix: str) -> List[Path]:
+        """Queue one generation and return the image paths it produced."""
+        wf = copy.deepcopy(self.workflow)
+        wf[self.prompt_node]["inputs"]["value"] = prompt
+        for nid in self.seed_nodes:
+            wf[nid]["inputs"]["seed"] = int(seed)
+        for nid in self.save_nodes:
+            wf[nid]["inputs"]["filename_prefix"] = filename_prefix
+
+        resp = requests.post(
+            f"{self.base_url}/prompt",
+            json={"prompt": wf},
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"ComfyUI rejected the workflow ({resp.status_code}): {resp.text[:400]}")
+        body = resp.json()
+        if body.get("node_errors"):
+            raise RuntimeError(f"ComfyUI node errors: {json.dumps(body['node_errors'])[:400]}")
+        prompt_id = body.get("prompt_id")
+        if not prompt_id:
+            raise RuntimeError(f"ComfyUI did not return a prompt_id: {body}")
+
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            time.sleep(1.5)
+            try:
+                hist = requests.get(f"{self.base_url}/history/{prompt_id}", timeout=20).json()
+            except Exception:
+                continue
+            if prompt_id not in hist:
+                continue
+            entry = hist[prompt_id]
+            status = entry.get("status", {}).get("status_str")
+            if status == "error":
+                msgs = entry.get("status", {}).get("messages", [])
+                raise RuntimeError(f"ComfyUI generation failed: {str(msgs[-3:])[:400]}")
+            images: List[Path] = []
+            for out in entry.get("outputs", {}).values():
+                for im in out.get("images", []):
+                    if im.get("type") != "output":
+                        continue
+                    images.append(self._resolve_output(im))
+            if images:
+                return images
+            if status == "success":
+                return []
+        raise TimeoutError(f"ComfyUI did not finish within {self.timeout}s")
+
+    def _resolve_output(self, image_info: Dict[str, Any]) -> Path:
+        """Download the generated image via the API into a temp file.
+
+        Going through /view instead of reading ComfyUI's output directory means
+        this also works when ComfyUI runs in another container or on a remote
+        host, where that directory is not visible to us.
+        """
+        params = {
+            "filename": image_info.get("filename", ""),
+            "subfolder": image_info.get("subfolder", ""),
+            "type": image_info.get("type", "output"),
+        }
+        resp = requests.get(f"{self.base_url}/view", params=params, timeout=120)
+        resp.raise_for_status()
+        suffix = Path(params["filename"]).suffix or ".png"
+        tmp = Path(tempfile.mkstemp(suffix=suffix, prefix="comfyui_")[1])
+        tmp.write_bytes(resp.content)
+        return tmp
+
+
+def run_comfyui_generation(
+    client: "ComfyUIClient",
+    prompts: List[Dict[str, Any]],
+    frames_dir: Path,
+    jobs_dir: Path,
+    lm_client: Optional["LMStudioPromptClient"] = None,
+    project_title: str = "",
+) -> Dict[str, int]:
+    """Generate images per weak class and write them where SAM3 labeling expects.
+
+    Filenames follow the `<job_stem>_<n>` convention that class_for_frame()
+    parses, and a _class_map.json is written so the frame -> class link survives
+    even if a filename is mangled.
+    """
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    class_map: Dict[str, str] = {}
+    generated: Dict[str, int] = {}
+    total_planned = sum(int(p["count"]) for p in prompts)
+    done = 0
+
+    prompt_log: Dict[str, List[str]] = {}
+
+    for spec in prompts:
+        class_name = spec["class_name"]
+        job_stem = spec["name"]
+        class_map[job_stem] = class_name
+        count = max(1, int(spec["count"]))
+
+        # One distinct prompt per image. LM Studio first (most varied), then the
+        # deterministic variation table. Both are topped up / trimmed to `count`
+        # so a short LLM reply cannot reduce how many images we generate.
+        per_image: List[str] = []
+        if lm_client is not None and lm_client.model:
+            per_image = lmstudio_scene_prompts(lm_client, project_title, class_name, count)
+            if per_image:
+                print(f"\n  {Colors.GREEN}✓ LM Studio wrote {len(per_image)} prompt(s) for {class_name}{Colors.ENDC}")
+            else:
+                print(f"\n  {Colors.YELLOW}⚠ LM Studio gave no usable prompts for {class_name}; using built-in variations{Colors.ENDC}")
+        if len(per_image) < count:
+            fill = varied_scene_prompts(project_title, class_name, count - len(per_image), seed_offset=len(per_image))
+            per_image.extend(fill)
+        per_image = per_image[:count]
+        prompt_log[class_name] = per_image
+
+        made = 0
+        for i in range(count):
+            seed = int(spec["seed"]) + i
+            try:
+                images = client.generate(per_image[i], seed, f"{job_stem}_{i:05d}")
+            except Exception as e:
+                print(f"\n  {Colors.YELLOW}⚠ {class_name} image {i+1}/{count} failed: {str(e)[:140]}{Colors.ENDC}")
+                continue
+            for j, src in enumerate(images):
+                dst = frames_dir / f"{job_stem}_{i:05d}_{j:02d}{src.suffix.lower()}"
+                shutil.move(str(src), dst)
+                made += 1
+            done += 1
+            pct = (done / total_planned * 100) if total_planned else 100
+            bar_w = 24
+            filled = int(bar_w * done / total_planned) if total_planned else bar_w
+            bar = "█" * filled + "░" * (bar_w - filled)
+            print(
+                f"\r  {Colors.CYAN}[{bar}]{Colors.ENDC} {pct:5.1f}% | "
+                f"generating {class_name} ({done}/{total_planned} images)",
+                end="", flush=True,
+            )
+        generated[class_name] = made
+
+    print()
+    write_json_file(jobs_dir / "_class_map.json", class_map)
+    # Keep the exact prompt used for every image so a bad batch can be traced
+    # back to its wording rather than guessed at.
+    write_json_file(jobs_dir / "_prompts_used.json", prompt_log)
+    return generated
 
 
 def run_cosmos_prompt_batch(
@@ -1813,6 +2252,14 @@ Examples:
                         help="Where Cosmos writes generated videos; supports {project_id}")
     parser.add_argument("--cosmos-frames-dir", type=str, default="cosmos/frames/project_{project_id}",
                         help="Where extracted Cosmos frames are saved; supports {project_id}")
+    parser.add_argument("--comfyui-augment", action="store_true",
+                        help="Generate weak-class images with ComfyUI (instead of Cosmos) and verify them with SAM3")
+    parser.add_argument("--comfyui-url", type=str, default=DEFAULT_COMFYUI_URL,
+                        help=f"ComfyUI server URL (default: {DEFAULT_COMFYUI_URL})")
+    parser.add_argument("--comfyui-workflow", type=str, default=DEFAULT_COMFYUI_WORKFLOW,
+                        help="Path to an API-format ComfyUI workflow JSON")
+    parser.add_argument("--comfyui-timeout", type=int, default=600,
+                        help="Seconds to wait for one ComfyUI image (default: 600)")
     parser.add_argument("--lmstudio-url", type=str, default=DEFAULT_LM_STUDIO_API_BASE,
                         help=f"LM Studio OpenAI-compatible API base (default: {DEFAULT_LM_STUDIO_API_BASE})")
     parser.add_argument("--lmstudio-model", type=str, default=DEFAULT_LM_STUDIO_MODEL,
@@ -1825,8 +2272,11 @@ Examples:
     args = parser.parse_args()
     args.sam3_batch_size = parse_sam3_batch_size(args.sam3_batch_size, DEFAULT_SAM3_BATCH_SIZE)
 
-    if args.cosmos_augment:
+    if args.cosmos_augment or args.comfyui_augment:
         args.balance_classes = True
+    if args.cosmos_augment and args.comfyui_augment:
+        print(f"{Colors.RED}✗ Use either --cosmos-augment or --comfyui-augment, not both{Colors.ENDC}")
+        sys.exit(1)
     if args.max_workers:
         args.workers = cpu_worker_count()
         args.batch_size = max(args.batch_size, args.workers)
@@ -1901,13 +2351,33 @@ Examples:
     ls_client = LabelStudioClient(args.ls_url, args.ls_token)
     sam3_client = None
     
-    if args.auto_label or args.cosmos_augment:
+    if args.auto_label or args.cosmos_augment or args.comfyui_augment:
         sam3_client = SAM3Client(args.sam3_url)
         if not sam3_client.health_check():
             print(f"{Colors.RED}✗ SAM3 server not responding at {args.sam3_url}{Colors.ENDC}")
             print(f"  Start the server with: uvicorn app.main:app --port 8080")
             sys.exit(1)
         print(f"{Colors.GREEN}✓ SAM3 server connected{Colors.ENDC}")
+
+    # Validate ComfyUI + the workflow file up front. Generation only runs after
+    # the (possibly hours-long) labeling pass, so a bad URL or an unexported
+    # workflow must fail now rather than after all that work.
+    comfyui_client = None
+    if args.comfyui_augment:
+        try:
+            comfyui_client = ComfyUIClient(args.comfyui_url, Path(args.comfyui_workflow), args.comfyui_timeout)
+        except Exception as e:
+            print(f"{Colors.RED}✗ ComfyUI workflow problem: {e}{Colors.ENDC}")
+            sys.exit(1)
+        if not comfyui_client.health_check():
+            print(f"{Colors.RED}✗ ComfyUI not responding at {args.comfyui_url}{Colors.ENDC}")
+            print("  Start ComfyUI, or pass --comfyui-url.")
+            sys.exit(1)
+        print(
+            f"{Colors.GREEN}✓ ComfyUI connected{Colors.ENDC} "
+            f"(workflow: {Path(args.comfyui_workflow).name}, "
+            f"prompt node: {comfyui_client.prompt_node})"
+        )
     
     # Get project info
     print_section("Fetching Project Info")
@@ -2059,7 +2529,53 @@ Examples:
             batch_iter = ls_client.iter_task_batches(args.project_id, batch_size=batch_size)
 
         streamed_tasks = 0
-        for batch in batch_iter:
+        # A run over a million tasks takes days, so a single transient failure
+        # (Label Studio restart, network blip, Ctrl-C) must NOT discard the work
+        # already labelled. Everything below keeps going or breaks out of the
+        # loop, so the split/dataset.yaml step downstream still runs on whatever
+        # was completed.
+        consecutive_fetch_errors = 0
+        MAX_CONSECUTIVE_FETCH_ERRORS = 10
+        batch_iterator = iter(batch_iter)
+        interrupted = False
+
+        while True:
+            if args.max_tasks > 0 and streamed_tasks >= args.max_tasks:
+                break
+            try:
+                batch = next(batch_iterator)
+            except StopIteration:
+                break
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}⚠ Interrupted while fetching tasks. "
+                      f"Keeping the {stats.success} image(s) already labelled.{Colors.ENDC}")
+                interrupted = True
+                break
+            except Exception as e:
+                consecutive_fetch_errors += 1
+                stats.increment_failed(f"task_fetch_error:{type(e).__name__}")
+                print(f"\n  {Colors.YELLOW}⚠ Task fetch failed "
+                      f"({consecutive_fetch_errors}/{MAX_CONSECUTIVE_FETCH_ERRORS}): "
+                      f"{str(e)[:120]}{Colors.ENDC}")
+                if consecutive_fetch_errors >= MAX_CONSECUTIVE_FETCH_ERRORS:
+                    print(f"  {Colors.RED}✗ Giving up on fetching more tasks; "
+                          f"finishing with what was labelled so far.{Colors.ENDC}")
+                    break
+                # The generator holds the page cursor, so it cannot be resumed
+                # after raising. Rebuild it and skip past the pages already done.
+                time.sleep(min(60, 5 * consecutive_fetch_errors))
+                try:
+                    batch_iterator = iter(
+                        ls_client.iter_task_batches(args.project_id, batch_size=batch_size)
+                    )
+                    for _ in range(batch_num):
+                        next(batch_iterator, None)
+                except Exception:
+                    pass
+                continue
+
+            consecutive_fetch_errors = 0
+
             if args.max_tasks > 0:
                 remaining = args.max_tasks - streamed_tasks
                 if remaining <= 0:
@@ -2071,24 +2587,39 @@ Examples:
             streamed_tasks += len(batch)
             batch_num += 1
             batch_info = f"Batch {batch_num} ({len(batch)} tasks)"
-            
-            process_batch(
-                batch,
-                ls_client,
-                sam3_client,
-                temp_images_dir,
-                temp_labels_dir,
-                label_to_id,
-                args.use_existing,
-                args.auto_label,
-                stats,
-                project_labels=labels,
-                preview_dir=preview_dir,
-                num_workers=args.workers,
-                sam3_batch_size=args.sam3_batch_size,
-            )
-            
+
+            try:
+                process_batch(
+                    batch,
+                    ls_client,
+                    sam3_client,
+                    temp_images_dir,
+                    temp_labels_dir,
+                    label_to_id,
+                    args.use_existing,
+                    args.auto_label,
+                    stats,
+                    project_labels=labels,
+                    preview_dir=preview_dir,
+                    num_workers=args.workers,
+                    sam3_batch_size=args.sam3_batch_size,
+                )
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}⚠ Interrupted. Keeping the "
+                      f"{stats.success} image(s) already labelled.{Colors.ENDC}")
+                interrupted = True
+                break
+            except Exception as e:
+                # One bad batch must not end a multi-day run.
+                stats.increment_failed(f"batch_error:{type(e).__name__}")
+                print(f"\n  {Colors.YELLOW}⚠ Batch {batch_num} failed, continuing: "
+                      f"{str(e)[:120]}{Colors.ENDC}")
+                continue
+
             stats.print_progress(batch_info=batch_info)
+
+        if interrupted:
+            print(f"{Colors.CYAN}ℹ Proceeding to split + dataset.yaml so the run is still usable.{Colors.ENDC}")
     
     print()  # New line after progress bar
     
@@ -2213,7 +2744,85 @@ Examples:
         print_section("Cosmos Synthetic Augmentation")
         print(f"{Colors.GREEN}✓ Skipped: no weak classes found{Colors.ENDC}")
 
-    if args.balance_classes or args.cosmos_augment:
+    if args.comfyui_augment and weak_classes and comfyui_client is not None:
+        print_section("ComfyUI Synthetic Augmentation")
+        project_title = project.get("title", f"project_{args.project_id}")
+        prompts_path = project_path(args.cosmos_prompts_out, args.project_id)
+        jobs_dir = project_path(args.cosmos_jobs_dir, args.project_id)
+        frames_dir = project_path(args.cosmos_frames_dir, args.project_id)
+
+        image_prompts = comfyui_prompts(project_title, weak_classes)
+        write_json_file(prompts_path, image_prompts)
+        print(f"{Colors.GREEN}✓ Saved ComfyUI prompts: {prompts_path}{Colors.ENDC}")
+        planned = sum(int(p["count"]) for p in image_prompts)
+        print(f"{Colors.CYAN}ℹ Generating up to {planned} images for {len(image_prompts)} weak class(es)...{Colors.ENDC}")
+
+        # Optional: LM Studio writes a distinct prompt per image. Without it the
+        # built-in scene/camera variation table is used, so this stays optional.
+        lm_client = None
+        if args.lmstudio_model:
+            lm_client = LMStudioPromptClient(
+                args.lmstudio_url,
+                args.lmstudio_api_key,
+                args.lmstudio_model,
+                args.lmstudio_timeout,
+            )
+            print(f"{Colors.CYAN}ℹ Per-image prompts from LM Studio ({args.lmstudio_model}){Colors.ENDC}")
+        else:
+            print(f"{Colors.CYAN}ℹ Per-image prompts from built-in scene variations "
+                  f"(set --lmstudio-model to use an LLM){Colors.ENDC}")
+
+        try:
+            made = run_comfyui_generation(
+                comfyui_client, image_prompts, frames_dir, jobs_dir,
+                lm_client=lm_client, project_title=project_title,
+            )
+        except Exception as e:
+            print(f"{Colors.RED}✗ ComfyUI generation failed: {e}{Colors.ENDC}")
+            write_quality_report(
+                output_dir,
+                project,
+                labels,
+                real_class_counts,
+                dict(stats.skipped_reasons),
+                dict(stats.failed_reasons),
+                weak_classes,
+                prompts_path,
+                None,
+            )
+            sys.exit(1)
+
+        total_made = sum(made.values())
+        print(f"{Colors.GREEN}✓ Generated {total_made} image(s) into {frames_dir}{Colors.ENDC}")
+
+        if total_made:
+            print(f"{Colors.CYAN}ℹ Verifying generated images with SAM3 (only accepted ones enter train/)...{Colors.ENDC}")
+            synthetic_report = label_synthetic_frames(
+                frames_dir,
+                jobs_dir,
+                output_dir,
+                label_to_id,
+                sam3_client,
+                preview_dir,
+            )
+            synthetic_report["generator"] = "comfyui"
+            synthetic_report["workflow"] = str(args.comfyui_workflow)
+            synthetic_report["generated_by_class"] = made
+            counts["train"] += int(synthetic_report["accepted_images"])
+            print(
+                f"{Colors.GREEN}✓ Accepted {synthetic_report['accepted_images']}/{total_made} synthetic train images "
+                f"with {synthetic_report['accepted_boxes']} boxes{Colors.ENDC}"
+            )
+            if synthetic_report["rejected_images"]:
+                print(
+                    f"  {Colors.YELLOW}Rejected {synthetic_report['rejected_images']} "
+                    f"(SAM3 did not confirm the target class){Colors.ENDC}"
+                )
+    elif args.comfyui_augment:
+        print_section("ComfyUI Synthetic Augmentation")
+        print(f"{Colors.GREEN}✓ Skipped: no weak classes found{Colors.ENDC}")
+
+    if args.balance_classes or args.cosmos_augment or args.comfyui_augment:
         write_quality_report(
             output_dir,
             project,
